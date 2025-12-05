@@ -448,6 +448,8 @@ if __name__ == "__main__":
         done = False
         steps = 0
 
+        
+
         while not done :
             action = env.action_space.sample()
             obs, reward, terminated, truncated, info = env.step(action)
