@@ -8,6 +8,7 @@ from SIMAX.Simulation import SimulationDataset
 from SIMAX.Controller import Controller_PID
 from utils import RC5_steady_state_sys
 import jax.numpy as jnp
+import equinox as eqx
 
 # Colonnes utilisées dans le dataset
 CONTROL_COLS = ()
@@ -17,6 +18,8 @@ DISTURBANCE_COLS = (
     "weaSta_reaWeaHGloHor_y",
     "weaSta_reaWeaTDryBul_y",
     "reaQHeaPumCon_y",
+    "LowerSetp[1]",
+    "UpperSetp[1]",
 )
 
 # ------------------------------------------------------------------
@@ -35,7 +38,7 @@ dataset = SimulationDataset.from_csv(
     disturbance_cols=DISTURBANCE_COLS,
 )
 
-N = 60_000
+N = 60_000 #280_000 datas max
 n_total = dataset.time.shape[0]
 gamma = min(1.0, N / n_total)      # fraction dans ]0, 1]
 dataset_short = dataset.take_fraction(gamma)
@@ -115,6 +118,21 @@ class MyMinimalEnv(gym.Env):
         # Longueur du dataset de perturbations (météo, gains internes, etc.)
         self.n = dataset_short.time.shape[0]
 
+        # Cache numpy pour éviter les __getitem__ JAX coûteux dans l'observation
+        self._dist_matrix = np.stack(
+            [
+                np.asarray(dataset_short.d["weaSta_reaWeaTDryBul_y"], dtype=np.float32),
+                np.asarray(dataset_short.d["weaSta_reaWeaHGloHor_y"], dtype=np.float32),
+                np.asarray(dataset_short.d["InternalGainsCon[1]"], dtype=np.float32),
+                np.asarray(dataset_short.d["InternalGainsRad[1]"], dtype=np.float32),
+                np.asarray(dataset_short.d["reaQHeaPumCon_y"], dtype=np.float32),
+                np.asarray(dataset_short.d["LowerSetp[1]"], dtype=np.float32),
+                np.asarray(dataset_short.d["UpperSetp[1]"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+        self._time_np = np.asarray(dataset_short.time, dtype=np.float64)
+
         # Contraintes sur l'indice de début d'épisode :
         # - avoir warmup_steps pas de marge avant
         # - avoir regressive_horizon pas dans le passé
@@ -131,8 +149,8 @@ class MyMinimalEnv(gym.Env):
             )
 
         # ---------- dimension de l'observation ----------
-        # Fenêtre sur les perturbations du dataset : Ta, qsol, qocc, qocr, qcd
-        self.n_features = 5
+        # Fenêtre sur les perturbations du dataset : Ta, qsol, qocc, qocr, qcd, lower_sp, upper_sp
+        self.n_features = 7
         self.n_past = self.regressive_horizon + 1     # t-h, ..., t
         self.n_fut = self.predictive_horizon          # t+1, ..., t+H
         self.n_hist_total = self.n_past + self.n_fut
@@ -182,6 +200,10 @@ class MyMinimalEnv(gym.Env):
         self.ep_control = []
         self.ep_rewards = []
         self.ep_indiv_rewards = []
+        self._episode_plotted = False
+
+        # Cache de PID pour éviter de recréer des contrôleurs (même structure = pas de recompilation)
+        self._pid_cache: dict[int, Controller_PID] = {}
 
     # ---------------------- helpers internes ---------------------- #
     def _to_steps(self, period):
@@ -191,26 +213,20 @@ class MyMinimalEnv(gym.Env):
         return max(0, steps)
 
     def _get_features_at(self, idx: int) -> np.ndarray:
-        """Retourne [Ta, qsol, qocc, qocr, qcd] au pas idx."""
-        d = dataset_short.d
-        ta   = float(d["weaSta_reaWeaTDryBul_y"][idx])
-        qsol = float(d["weaSta_reaWeaHGloHor_y"][idx])
-        qocc = float(d["InternalGainsCon[1]"][idx])
-        qocr = float(d["InternalGainsRad[1]"][idx])
-        qcd  = float(d["reaQHeaPumCon_y"][idx])
-        return np.array([ta, qsol, qocc, qocr, qcd], dtype=np.float32)
+        """Retourne [Ta, qsol, qocc, qocr, qcd, lower_sp, upper_sp] au pas idx."""
+        return self._dist_matrix[idx]
+
+    def _get_band_at(self, idx: int) -> tuple[float, float]:
+        """Limites de confort [bas, haut] en Kelvin au pas idx."""
+        row = self._dist_matrix[idx]
+        return float(row[5]), float(row[6])
 
     def _build_disturbance_window(self, idx: int) -> np.ndarray:
         """Fenêtre [passé, présent, futur] sur les perturbations du dataset."""
-        past_idxs = range(idx - self.regressive_horizon, idx + 1)
-        fut_idxs = range(idx + 1, idx + 1 + self.predictive_horizon)
-
-        feats = [self._get_features_at(i) for i in past_idxs]
-        feats += [self._get_features_at(i) for i in fut_idxs]
-
-        if feats:
-            return np.concatenate(feats, axis=0).astype(np.float32)
-        return np.zeros(0, dtype=np.float32)
+        start = idx - self.regressive_horizon
+        end = idx + 1 + self.predictive_horizon
+        window = self._dist_matrix[start:end]
+        return window.reshape(-1)
 
     def _build_observation(self) -> np.ndarray:
         """Concatène : [fenêtre perturbations][hist Tz][hist setpoints]."""
@@ -232,15 +248,23 @@ class MyMinimalEnv(gym.Env):
 
     # ---------- Hooks à remplir avec SIMAX / PID ---------- #
     def _init_state(self, idx: int) -> np.ndarray:
-        """Construit un état initial pour la simu au temps `idx`.
-        """
-        ta, qsol, qocc, qocr, qcd = map(float, self._get_features_at(idx))
+        """Construit un état initial pour la simu au temps `idx`."""
+        feats = self._get_features_at(idx)
+        ta, qsol, qocc, qocr, qcd = map(float, feats[:5])
         x_init = RC5_steady_state_sys(ta, qsol, qocc, qocr, qcd, sim.model.theta)
         return np.asarray(x_init, dtype=np.float32)
 
     def _make_pid(self, setpoint: float, horizon_len: int) -> Controller_PID:
         sp = jnp.full((horizon_len,), float(setpoint), dtype=jnp.float64)
-        return Controller_PID(k_p=0.6, k_i=0.6 / 800.0, k_d=0.0, n=1, verbose=False, SetPoints=sp)
+        cached = self._pid_cache.get(horizon_len)
+        if cached is None:
+            pid = Controller_PID(k_p=0.6, k_i=0.6 / 800.0, k_d=0.0, n=1, verbose=False, SetPoints=sp)
+            self._pid_cache[horizon_len] = pid
+            return pid
+        # On réutilise la structure existante et on ne change que la consigne
+        pid = eqx.tree_at(lambda c: c.SetPoints, cached, sp)
+        self._pid_cache[horizon_len] = pid
+        return pid
 
     def _reset_episode_logs(self):
         self.ep_idx.clear()
@@ -253,7 +277,7 @@ class MyMinimalEnv(gym.Env):
 
     def _log_step(self, idx: int, tz: float, setpoint: float, u: float, reward: float, indiv_reward: tuple[float, float]):
         self.ep_idx.append(idx)
-        self.ep_time.append(float(dataset_short.time[idx]))
+        self.ep_time.append(float(self._time_np[idx]))
         self.ep_tz.append(float(tz))
         self.ep_setpoint.append(float(setpoint))
         self.ep_control.append(float(u))
@@ -273,6 +297,8 @@ class MyMinimalEnv(gym.Env):
         t_days = np.asarray(self.ep_time, dtype=float) / 86400.0
         tz_c = np.asarray(self.ep_tz, dtype=float) - 273.15
         sp_c = np.asarray(self.ep_setpoint, dtype=float) - 273.15
+        lower_c = np.asarray([self._dist_matrix[i, 5] for i in self.ep_idx], dtype=float) - 273.15
+        upper_c = np.asarray([self._dist_matrix[i, 6] for i in self.ep_idx], dtype=float) - 273.15
         u_arr = np.asarray(self.ep_control, dtype=float)
         rewards = np.asarray(self.ep_rewards, dtype=float)
         indiv = np.asarray(self.ep_indiv_rewards, dtype=float) if self.ep_indiv_rewards else None
@@ -280,6 +306,7 @@ class MyMinimalEnv(gym.Env):
         ta = np.asarray([dataset_short.d["weaSta_reaWeaTDryBul_y"][i] for i in self.ep_idx], dtype=float) - 273.15
         qsol = np.asarray([dataset_short.d["weaSta_reaWeaHGloHor_y"][i] for i in self.ep_idx], dtype=float)
 
+        axs[0].fill_between(t_days, lower_c, upper_c, color="palegreen", alpha=0.3, label="Bande confort")
         axs[0].plot(t_days, sp_c, "--", color="gray", linewidth=1, label="Setpoint")
         axs[0].plot(t_days, tz_c, "-", color="darkorange", linewidth=1, label="Tz")
         axs[0].set_ylabel("Tz / setpoint\n(°C)")
@@ -346,8 +373,9 @@ class MyMinimalEnv(gym.Env):
         # reset état interne PID pour la boucle contrôle RL
         self.current_setpoint = self.t_set
         # Si on enchaîne les épisodes, on peut afficher celui qui vient de finir
-        if self.render_episodes and self.ep_idx:
+        if self.render_episodes and self.ep_idx and not self._episode_plotted:
             self._plot_episode()
+        self._episode_plotted = False
         self.sp_hist.fill(self.t_set)
         self._reset_episode_logs()
         self.ep_steps = 0
@@ -399,21 +427,31 @@ class MyMinimalEnv(gym.Env):
             truncated = True
 
         obs = self._build_observation()
-        comfort_penalty = -abs(float(self.x[0]) - tz_set)
+        lower_sp, upper_sp = self._get_band_at(self.idx)
+
+        tz_curr = float(self.x[0])
+        comfort_below = max(lower_sp - tz_curr, 0.0)
+        comfort_above = max(tz_curr - upper_sp, 0.0)
+        comfort_penalty = -(comfort_below + comfort_above)
         energy_penalty = -0.001 * float(np.clip(u_rl, 0.0, 1.0).mean())
         reward = comfort_penalty + energy_penalty
-        self._log_step(self.idx, float(self.x[0]), tz_set, float(u_rl[-1]), reward, (comfort_penalty, energy_penalty))
+
+        self._log_step(self.idx, tz_curr, tz_set, float(u_rl[-1]), reward, (comfort_penalty, energy_penalty))
         info = {
             "idx": self.idx,
             "predictive_horizon": self.predictive_horizon,
             "regressive_horizon": self.regressive_horizon,
-            "Tz": float(self.x[0]),
+            "Tz": tz_curr,
             "setpoint": tz_set,
             "ep_steps": self.ep_steps,
+            "lower_band": lower_sp,
+            "upper_band": upper_sp,
         }
 
         if self.render_episodes and (terminated or truncated):
-            self._plot_episode()
+            if not self._episode_plotted:
+                self._plot_episode()
+                self._episode_plotted = True
 
         return obs, reward, terminated, truncated, info
 
@@ -427,40 +465,52 @@ class MyMinimalEnv(gym.Env):
         pass
 
 
+
+class NormalizeAction(gym.ActionWrapper):
+    """
+    L'agent voit des actions dans [-1, 1].
+    On les rescales vers [low, high] pour l'env interne.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        assert isinstance(env.action_space, spaces.Box)
+        self._low = env.action_space.low.astype(np.float32)
+        self._high = env.action_space.high.astype(np.float32)
+
+        # Vue "agent" : actions normalisées
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=env.action_space.shape,
+            dtype=np.float32,
+        )
+
+    def action(self, action):
+        # action in [-1, 1] -> [low, high]
+        action = np.asarray(action, dtype=np.float32)
+        return self._low + (action + 1.0) * 0.5 * (self._high - self._low)
+
+
+
+
 if __name__ == "__main__":
     # Petit smoke-test : plusieurs épisodes aléatoires,
     # avec affichage automatique à la fin de chaque épisode
     env = MyMinimalEnv(
-        step_period=360,
+        step_period=3600,
         predictive_period=24 * 3600,
         regressive_period=24 * 3600,
         state_hist_steps=5,
         warmup_steps=24,
         render_episodes=True,      # important pour que _plot_episode soit appelé
-        max_episode_length=360*1, #Pas max par episode
+        max_episode_length=24*7, #Pas max par episode
     )
+    env = NormalizeAction(env)
 
-    n_episodes = 1
+    from stable_baselines3 import PPO
 
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=10_000)
 
-    for ep in range(n_episodes):
-        obs, info = env.reset(seed=123 + ep)
-        done = False
-        steps = 0
-
-        
-
-        while not done :
-            action = env.action_space.sample()
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            steps += 1
-
-        print(f"Épisode {ep+1}/{n_episodes} terminé en {steps} pas.")
-
-        # Optionnel : si tu veux forcer l'affichage ici en plus
-        # env.render()
-
-    # Pause pour garder la figure ouverte
-    input("Press Enter to close...")
     env.close()
