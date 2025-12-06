@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping
 
 import jax64  # noqa: F401
@@ -71,7 +70,7 @@ def _get_setpoints_window(setpoints, i, window_size, forecast, target_len, fallb
 # Controllers
 # ------------------------------------------------------------------ #
 
-class Controller(ABC):
+class Controller(eqx.Module, ABC):
     """Base class for controllers compatibles avec les simulations JAX."""
 
     def init_state(self):
@@ -90,7 +89,6 @@ class Controller(ABC):
         raise NotImplementedError
 
 
-@dataclass(eq=False, frozen=True)
 class Controller_Constant(Controller):
     u_c: float
     activate: bool = True
@@ -100,7 +98,6 @@ class Controller_Constant(Controller):
         return {"oveHeaPumY_u": jnp.asarray(self.u_c, dtype=jnp.float64)}, ctrl_state
 
 
-@dataclass(eq=False, frozen=True)
 class Controller_PID(Controller):
     TSet: float = 273.15 + 21  # Setpoint unique par défaut
     k_p: float = 1.0
@@ -108,7 +105,7 @@ class Controller_PID(Controller):
     k_i: float = 0.0
     n: int = 1
     verbose: bool = True
-    SetPoints: jnp.ndarray = field(default_factory=lambda: jnp.asarray([], dtype=jnp.float64))
+    SetPoints: jnp.ndarray = eqx.field(default_factory=lambda: jnp.asarray([], dtype=jnp.float64))
 
     def init_state(self, state=None):  # type: ignore[override]
         return {
@@ -181,21 +178,15 @@ class Controller_PID(Controller):
 
 
 
-@dataclass(eq=False, frozen=True)
 class Controller_constSeq(Controller):
     oveHeaPumY_u: jnp.ndarray
-    _length: int = field(init=False)
-
-    def __post_init__(self):
-        seq = jnp.asarray(self.oveHeaPumY_u, dtype=jnp.float64)
-        object.__setattr__(self, "oveHeaPumY_u", seq)
-        object.__setattr__(self, "_length", int(seq.shape[0]))
 
     def compute_control(self, *, idx, y_measurements, disturbances, ctrl_state, ST=None, dt=None, forecast=None, W=None):
-        clipped = jnp.clip(idx, 0, max(self._length - 1, 0))
+        seq = jnp.asarray(self.oveHeaPumY_u, dtype=jnp.float64)
+        clipped = jnp.clip(idx, 0, max(seq.shape[0] - 1, 0))
         return {
-            "oveHeaPumY_u": self.oveHeaPumY_u[clipped],
-            "oveHeaPumY_activate": jnp.ones_like(self.oveHeaPumY_u[clipped]),
+            "oveHeaPumY_u": seq[clipped],
+            "oveHeaPumY_activate": jnp.ones_like(seq[clipped]),
         }, ctrl_state
 
 
@@ -288,9 +279,9 @@ class Controller_MPC(Controller):
     sim: "Simulation_JAX"
     window_size: int
     n: int = 1 # Control every n steps
-    W: jnp.ndarray = field(default_factory=lambda: jnp.asarray([0.2/1000.0, 10.0], dtype=jnp.float64))
+    W: jnp.ndarray = eqx.field(default_factory=lambda: jnp.asarray([0.2/1000.0, 10.0], dtype=jnp.float64))
 
-    SetPoints: jnp.ndarray = field(default_factory=lambda: jnp.asarray([],dtype=jnp.float64))
+    SetPoints: jnp.ndarray = eqx.field(default_factory=lambda: jnp.asarray([],dtype=jnp.float64))
     i: int = 0
 
     def init_state(self):

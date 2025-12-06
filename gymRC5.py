@@ -9,6 +9,7 @@ from SIMAX.Controller import Controller_PID
 from utils import RC5_steady_state_sys
 import jax.numpy as jnp
 import equinox as eqx
+from torch.utils.tensorboard import SummaryWriter
 
 # Colonnes utilisées dans le dataset
 CONTROL_COLS = ()
@@ -38,7 +39,7 @@ dataset = SimulationDataset.from_csv(
     disturbance_cols=DISTURBANCE_COLS,
 )
 
-N = 60_000 #280_000 datas max
+N = 280_000 #280_000 datas max
 n_total = dataset.time.shape[0]
 gamma = min(1.0, N / n_total)      # fraction dans ]0, 1]
 dataset_short = dataset.take_fraction(gamma)
@@ -65,7 +66,6 @@ sim = sim_opti_loaded.copy(
     d=dataset_short.d,
 )
 
-sim.plot()
 
 class MyMinimalEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
@@ -84,6 +84,7 @@ class MyMinimalEnv(gym.Env):
         tz_max=273.15 + 28.0,
         render_episodes=False,   # plot auto en fin d'épisode
         max_episode_length=None, # nombre max de pas par épisode (None = limité par idx_max)
+        tensorboard_log=None,    # chemin pour les logs TensorBoard
     ):
         super().__init__()
 
@@ -201,6 +202,11 @@ class MyMinimalEnv(gym.Env):
         self.ep_rewards = []
         self.ep_indiv_rewards = []
         self._episode_plotted = False
+        self._episode_count = 0
+        self._total_steps = 0
+
+        # TensorBoard
+        self.writer = SummaryWriter(tensorboard_log) if tensorboard_log else None
 
         # Cache de PID pour éviter de recréer des contrôleurs (même structure = pas de recompilation)
         self._pid_cache: dict[int, Controller_PID] = {}
@@ -372,10 +378,16 @@ class MyMinimalEnv(gym.Env):
 
         # reset état interne PID pour la boucle contrôle RL
         self.current_setpoint = self.t_set
+        
+        # Logs TensorBoard
+        if self.writer and self.ep_rewards:
+            self.writer.add_scalar("episode/return", sum(self.ep_rewards), self._episode_count)
+        
         # Si on enchaîne les épisodes, on peut afficher celui qui vient de finir
-        if self.render_episodes and self.ep_idx and not self._episode_plotted:
+        if self.render_episodes and self.ep_idx and not self._episode_plotted and (self._episode_count % 10 == 0):
             self._plot_episode()
         self._episode_plotted = False
+        self._episode_count += 1
         self.sp_hist.fill(self.t_set)
         self._reset_episode_logs()
         self.ep_steps = 0
@@ -433,10 +445,11 @@ class MyMinimalEnv(gym.Env):
         comfort_below = max(lower_sp - tz_curr, 0.0)
         comfort_above = max(tz_curr - upper_sp, 0.0)
         comfort_penalty = -(comfort_below + comfort_above)
-        energy_penalty = -0.001 * float(np.clip(u_rl, 0.0, 1.0).mean())
+        energy_penalty = -1.0 * float(np.clip(u_rl, 0.0, 1.0).mean())
         reward = comfort_penalty + energy_penalty
 
         self._log_step(self.idx, tz_curr, tz_set, float(u_rl[-1]), reward, (comfort_penalty, energy_penalty))
+        
         info = {
             "idx": self.idx,
             "predictive_horizon": self.predictive_horizon,
@@ -449,7 +462,7 @@ class MyMinimalEnv(gym.Env):
         }
 
         if self.render_episodes and (terminated or truncated):
-            if not self._episode_plotted:
+            if not self._episode_plotted and (self._episode_count % 10 == 0):
                 self._plot_episode()
                 self._episode_plotted = True
 
@@ -462,7 +475,8 @@ class MyMinimalEnv(gym.Env):
             self._plot_episode()
 
     def close(self):
-        pass
+        if self.writer:
+            self.writer.close()
 
 
 
@@ -503,8 +517,9 @@ if __name__ == "__main__":
         regressive_period=24 * 3600,
         state_hist_steps=5,
         warmup_steps=24,
-        render_episodes=True,      # important pour que _plot_episode soit appelé
-        max_episode_length=24*7, #Pas max par episode
+        render_episodes=False,      # important pour que _plot_episode soit appelé
+        max_episode_length=24*14, #Pas max par episode
+        #tensorboard_log="agents/MyMinimalEnv_logs",  # logs TensorBoard
     )
     env = NormalizeAction(env)
 
@@ -514,3 +529,5 @@ if __name__ == "__main__":
     model.learn(total_timesteps=10_000)
 
     env.close()
+    
+    # Pour visualiser : tensorboard --logdir=agents/MyMinimalEnv_logs

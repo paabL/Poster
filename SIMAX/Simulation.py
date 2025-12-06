@@ -76,13 +76,85 @@ class SimulationDataset:
         return SimulationDataset(time=self.time[window], u=sub_u, d=sub_d)
 
 
+@eqx.filter_jit
+def _run_core(model, x0_arr, t_grid, ctrl, d_payloads, base_time_grid, integrator, use_subgrid: bool):
+    """Cœur jitté de la simulation (numérique pur)."""
+    dtype = x0_arr.dtype
+
+    dt0 = t_grid[1] - t_grid[0]
+    dt_seq = jnp.diff(t_grid, prepend=t_grid[:1] - dt0)
+
+    ctrl_state0 = ctrl.init_state()
+
+    n = t_grid.size
+    if use_subgrid:
+        base = jnp.asarray(base_time_grid, dtype=dtype)
+        sub0 = t_grid[0]
+        idx0 = jnp.nonzero(base == sub0, size=1, fill_value=0)[0]
+        offset = jnp.asarray(idx0, dtype=jnp.int32)[0]
+    else:
+        offset = jnp.asarray(0, dtype=jnp.int32)
+
+    d_keys = tuple(d_payloads.keys())
+    idx_seq = jnp.arange(n, dtype=jnp.int32)
+    global_idx = offset + idx_seq
+    d_series = []
+    for key in d_keys:
+        full = jnp.asarray(d_payloads[key], dtype=dtype)
+        d_series.append(jnp.take(full, global_idx, axis=0))
+
+    scan_inputs = (dt_seq, *d_series, idx_seq)
+
+    def scan_step(carry, data):
+        state, ctrl_state = carry
+        dt = data[0]
+        d_vals = data[1:-1]
+        idx = data[-1]
+        d_payload = {k: v for k, v in zip(d_keys, d_vals)}
+
+        u_payload, next_ctrl_state = ctrl.compute_control(
+            idx=idx,
+            y_measurements=state,
+            disturbances=d_payload,
+            ctrl_state=ctrl_state,
+            dt=dt,
+        )
+        u_payload = {k: jnp.asarray(v, dtype=dtype) for k, v in u_payload.items()}
+
+        def rhs(y):
+            return model.state_derivative(y, u_payload, d_payload)
+
+        nxt = integrator(rhs, state, dt)
+
+        y_out = model.h(nxt, u_payload, d_payload)
+        if isinstance(y_out, (tuple, list)):
+            y_vec = jnp.stack(
+                [jnp.asarray(comp, dtype=dtype) for comp in y_out]
+            ).astype(dtype)
+        else:
+            y_arr = jnp.asarray(y_out, dtype=dtype)
+            y_vec = y_arr.reshape((-1,))
+
+        record_u = {k: jnp.asarray(v, dtype=dtype) for k, v in u_payload.items()}
+
+        return (nxt, next_ctrl_state), (y_vec, nxt, record_u)
+
+    (_, _), (y_seq, states_seq, u_records) = lax.scan(
+        scan_step, (x0_arr, ctrl_state0), scan_inputs
+    )
+
+    controls = {k: jnp.asarray(v, dtype=dtype) for k, v in u_records.items()}
+
+    return t_grid, y_seq, states_seq, controls
+
+
 class Simulation_JAX(eqx.Module):
     """Moteur de simulation JAX pour systèmes dynamiques."""
 
     time_grid: jnp.ndarray
     d: dict[str, jnp.ndarray]
     model: Model_JAX
-    controller: "Controller" = eqx.field(static=True)
+    controller: "Controller"
     x0: jnp.ndarray
     integrator: Any | None = eqx.field(static=True, default=None)
 
@@ -147,79 +219,7 @@ class Simulation_JAX(eqx.Module):
         ctrl = controller or self.controller
 
         # Appel du cœur jitté
-        return self._run_impl(model, x0_arr, t_grid, ctrl, use_subgrid)
-
-    @eqx.filter_jit
-    def _run_impl(self, model, x0_arr, t_grid, ctrl, use_subgrid: bool):
-        """Cœur jitté de la simulation (numérique pur)."""
-        dtype = x0_arr.dtype
-
-        dt0 = t_grid[1] - t_grid[0]
-        dt_seq = jnp.diff(t_grid, prepend=t_grid[:1] - dt0)
-
-        ctrl_state0 = ctrl.init_state()
-
-        n = t_grid.size
-        if use_subgrid:
-            base = jnp.asarray(self.time_grid, dtype=dtype)
-            sub0 = t_grid[0]
-            idx0 = jnp.nonzero(base == sub0, size=1, fill_value=0)[0]
-            offset = jnp.asarray(idx0, dtype=jnp.int32)[0]
-        else:
-            offset = jnp.asarray(0, dtype=jnp.int32)
-
-        d_keys = tuple(self.d.keys())
-        idx_seq = jnp.arange(n, dtype=jnp.int32)
-        global_idx = offset + idx_seq
-        d_series = []
-        for key in d_keys:
-            full = jnp.asarray(self.d[key], dtype=dtype)
-            d_series.append(jnp.take(full, global_idx, axis=0))
-
-        scan_inputs = (dt_seq, *d_series, idx_seq)
-
-        def scan_step(carry, data):
-            state, ctrl_state = carry
-            dt = data[0]
-            d_vals = data[1:-1]
-            idx = data[-1]
-            d_payload = {k: v for k, v in zip(d_keys, d_vals)}
-
-            u_payload, next_ctrl_state = ctrl.compute_control(
-                idx=idx,
-                y_measurements=state,
-                disturbances=d_payload,
-                ctrl_state=ctrl_state,
-                dt=dt,
-            )
-            u_payload = {k: jnp.asarray(v, dtype=dtype) for k, v in u_payload.items()}
-
-            def rhs(y):
-                return model.state_derivative(y, u_payload, d_payload)
-
-            nxt = self.integrator(rhs, state, dt)
-
-            # Sorties via le modèle (générique)
-            y_out = model.h(nxt, u_payload, d_payload)
-            if isinstance(y_out, (tuple, list)):
-                y_vec = jnp.stack(
-                    [jnp.asarray(comp, dtype=dtype) for comp in y_out]
-                ).astype(dtype)
-            else:
-                y_arr = jnp.asarray(y_out, dtype=dtype)
-                y_vec = y_arr.reshape((-1,))  # (ny,)
-
-            record_u = {k: jnp.asarray(v, dtype=dtype) for k, v in u_payload.items()}
-
-            return (nxt, next_ctrl_state), (y_vec, nxt, record_u)
-
-        (_, _), (y_seq, states_seq, u_records) = lax.scan(
-            scan_step, (x0_arr, ctrl_state0), scan_inputs
-        )
-
-        controls = {k: jnp.asarray(v, dtype=dtype) for k, v in u_records.items()}
-
-        return t_grid, y_seq, states_seq, controls
+        return _run_core(model, x0_arr, t_grid, ctrl, self.d, self.time_grid, self.integrator, use_subgrid)
 
     # ---------- Version NumPy (débogage / traçage) ----------
 
