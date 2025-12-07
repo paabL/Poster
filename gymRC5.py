@@ -9,7 +9,6 @@ from SIMAX.Controller import Controller_PID
 from utils import RC5_steady_state_sys
 import jax.numpy as jnp
 import equinox as eqx
-from torch.utils.tensorboard import SummaryWriter
 
 # Colonnes utilisées dans le dataset
 CONTROL_COLS = ()
@@ -38,6 +37,24 @@ dataset = SimulationDataset.from_csv(
     control_cols=CONTROL_COLS,
     disturbance_cols=DISTURBANCE_COLS,
 )
+
+# Ajout d'un signal de prix d'électricité (€/kWh) en créneau :
+# 0.4 entre 18h et 22h, 0.2 le reste du temps.
+time_seconds = np.asarray(dataset.time, dtype=float)
+hours = (time_seconds / 3600.0) % 24.0
+electricity_price = np.where(
+    (hours >= 18.0) & (hours < 22.0),
+    0.4,
+    0.2,
+).astype(np.float64)
+
+dataset = SimulationDataset(
+    time=dataset.time,
+    u=dataset.u,
+    d={**dataset.d, "electricity_price": jnp.asarray(electricity_price, dtype=jnp.float64)},
+)
+
+
 
 N = 280_000 #280_000 datas max
 n_total = dataset.time.shape[0]
@@ -81,10 +98,9 @@ class MyMinimalEnv(gym.Env):
         warmup_steps=50,         # nb de pas de warmup PID
         render_mode=None,
         tz_min=273.15 + 15.0,
-        tz_max=273.15 + 28.0,
+        tz_max=273.15 + 30.0,
         render_episodes=False,   # plot auto en fin d'épisode
         max_episode_length=None, # nombre max de pas par épisode (None = limité par idx_max)
-        tensorboard_log=None,    # chemin pour les logs TensorBoard
     ):
         super().__init__()
 
@@ -193,7 +209,7 @@ class MyMinimalEnv(gym.Env):
         self.idx = self.idx_min
         self.ep_steps = 0
 
-        # Logs épisode (remplis durant step)
+        # Logs épisode (remplis durant step, pas RL)
         self.ep_idx = []
         self.ep_time = []
         self.ep_tz = []
@@ -201,12 +217,12 @@ class MyMinimalEnv(gym.Env):
         self.ep_control = []
         self.ep_rewards = []
         self.ep_indiv_rewards = []
+        # Logs fins pour le plot (≈30 s)
+        self.ep_idx_30s = []
+        self.ep_tz_30s = []
+        self.ep_u_30s = []
         self._episode_plotted = False
         self._episode_count = 0
-        self._total_steps = 0
-
-        # TensorBoard
-        self.writer = SummaryWriter(tensorboard_log) if tensorboard_log else None
 
         # Cache de PID pour éviter de recréer des contrôleurs (même structure = pas de recompilation)
         self._pid_cache: dict[int, Controller_PID] = {}
@@ -280,15 +296,25 @@ class MyMinimalEnv(gym.Env):
         self.ep_control.clear()
         self.ep_rewards.clear()
         self.ep_indiv_rewards.clear()
+        self.ep_idx_30s.clear()
+        self.ep_tz_30s.clear()
+        self.ep_u_30s.clear()
 
-    def _log_step(self, idx: int, tz: float, setpoint: float, u: float, reward: float, indiv_reward: tuple[float, float]):
+    def _log_step(self, idx: int, tz: float, setpoint: float, u: float, reward: float, indiv_reward):
         self.ep_idx.append(idx)
         self.ep_time.append(float(self._time_np[idx]))
         self.ep_tz.append(float(tz))
         self.ep_setpoint.append(float(setpoint))
         self.ep_control.append(float(u))
         self.ep_rewards.append(float(reward))
-        self.ep_indiv_rewards.append([float(indiv_reward[0]), float(indiv_reward[1])])
+        # indiv_reward = (comfort_penalty, energy_penalty, sat_penalty)
+        self.ep_indiv_rewards.append(
+            [
+                float(indiv_reward[0]),
+                float(indiv_reward[1]),
+                float(indiv_reward[2]),
+            ]
+        )
 
     def _plot_episode(self):
         if not self.ep_idx:
@@ -297,49 +323,103 @@ class MyMinimalEnv(gym.Env):
         plt.ion()
         fig = plt.gcf()
         fig.clear()
-        axs = fig.subplots(4, 1, sharex=True)
-        fig.set_size_inches(8, 6, forward=True)
+        fig.set_dpi(150)
+        axs = fig.subplots(6, 1, sharex=True)
+        fig.set_size_inches(10, 10, forward=True)
+        # Grille fine (≈30 s) pour Tz/u si dispo, sinon pas RL
+        if self.ep_idx_30s:
+            idx_main = np.asarray(self.ep_idx_30s, dtype=int)
+            t_days_main = self._time_np[idx_main] / 86400.0
+            tz_c = np.asarray(self.ep_tz_30s, dtype=float) - 273.15
+            u_arr = np.asarray(self.ep_u_30s, dtype=float)
+        else:
+            idx_main = np.asarray(self.ep_idx, dtype=int)
+            t_days_main = np.asarray(self.ep_time, dtype=float) / 86400.0
+            tz_c = np.asarray(self.ep_tz, dtype=float) - 273.15
+            u_arr = np.asarray(self.ep_control, dtype=float)
 
-        t_days = np.asarray(self.ep_time, dtype=float) / 86400.0
-        tz_c = np.asarray(self.ep_tz, dtype=float) - 273.15
-        sp_c = np.asarray(self.ep_setpoint, dtype=float) - 273.15
-        lower_c = np.asarray([self._dist_matrix[i, 5] for i in self.ep_idx], dtype=float) - 273.15
-        upper_c = np.asarray([self._dist_matrix[i, 6] for i in self.ep_idx], dtype=float) - 273.15
-        u_arr = np.asarray(self.ep_control, dtype=float)
+        lower_c = np.asarray([self._dist_matrix[i, 5] for i in idx_main], dtype=float) - 273.15
+        upper_c = np.asarray([self._dist_matrix[i, 6] for i in idx_main], dtype=float) - 273.15
+        ta = np.asarray([dataset_short.d["weaSta_reaWeaTDryBul_y"][i] for i in idx_main], dtype=float) - 273.15
+        qsol = np.asarray([dataset_short.d["weaSta_reaWeaHGloHor_y"][i] for i in idx_main], dtype=float)
+        qocc = np.asarray([dataset_short.d["InternalGainsCon[1]"][i] for i in idx_main], dtype=float)
+        qocr = np.asarray([dataset_short.d["InternalGainsRad[1]"][i] for i in idx_main], dtype=float)
+
+        # Setpoint / rewards restent au pas RL
+        t_days_rl = np.asarray(self.ep_time, dtype=float) / 86400.0
+        sp_rl = np.asarray(self.ep_setpoint, dtype=float) - 273.15
+        sp_c = np.interp(t_days_main, t_days_rl, sp_rl)
         rewards = np.asarray(self.ep_rewards, dtype=float)
         indiv = np.asarray(self.ep_indiv_rewards, dtype=float) if self.ep_indiv_rewards else None
 
-        ta = np.asarray([dataset_short.d["weaSta_reaWeaTDryBul_y"][i] for i in self.ep_idx], dtype=float) - 273.15
-        qsol = np.asarray([dataset_short.d["weaSta_reaWeaHGloHor_y"][i] for i in self.ep_idx], dtype=float)
+        # Légendes avec parts en pourcentage des sous-récompenses
+        reward_label = "reward"
+        comfort_label = "comfort"
+        energy_label = "energy"
+        sat_label = "saturation"
+        if indiv is not None and indiv.shape[1] >= 3:
+            total_reward = float(rewards.sum())
+            total_reward_safe = total_reward if abs(total_reward) > 1e-6 else 1.0
+            total_comfort = float(indiv[:, 0].sum())
+            total_energy = float(indiv[:, 1].sum())
+            total_sat = float(indiv[:, 2].sum())
+            comfort_pct = 100.0 * total_comfort / total_reward_safe
+            energy_pct = 100.0 * total_energy / total_reward_safe
+            sat_pct = 100.0 * total_sat / total_reward_safe
+            reward_label = f"reward (sum={total_reward:.2f})"
+            comfort_label = f"comfort ({comfort_pct:.0f}%)"
+            energy_label = f"energy ({energy_pct:.0f}%)"
+            sat_label = f"sat ({sat_pct:.0f}%)"
 
-        axs[0].fill_between(t_days, lower_c, upper_c, color="palegreen", alpha=0.3, label="Bande confort")
-        axs[0].plot(t_days, sp_c, "--", color="gray", linewidth=1, label="Setpoint")
-        axs[0].plot(t_days, tz_c, "-", color="darkorange", linewidth=1, label="Tz")
+        axs[0].fill_between(t_days_main, lower_c, upper_c, color="palegreen", alpha=0.3, label="Bande confort")
+        axs[0].plot(t_days_main, sp_c, "--", color="gray", linewidth=1, label="Setpoint")
+        axs[0].plot(t_days_main, tz_c, "-", color="darkorange", linewidth=1, label="Tz")
         axs[0].set_ylabel("Tz / setpoint\n(°C)")
         axs[0].legend(fontsize=7)
 
-        axs[1].plot(t_days, u_arr, "-", color="slateblue", linewidth=1)
+        axs[1].plot(t_days_main, u_arr, "-", color="slateblue", linewidth=1)
         axs[1].set_ylabel("Commande\n(-)")
 
-        axs[2].plot(t_days, rewards, "b", linewidth=1, label="reward")
+        axs[2].plot(t_days_rl, rewards, "b", linewidth=1, label=reward_label)
         if indiv is not None:
-            axs[2].plot(t_days, indiv[:, 0], "r", linewidth=1, label="comfort")
-            axs[2].plot(t_days, indiv[:, 1], "g", linewidth=1, label="energy")
+            axs[2].plot(t_days_rl, indiv[:, 0], "r", linewidth=1, label=comfort_label)
+            axs[2].plot(t_days_rl, indiv[:, 1], "g", linewidth=1, label=energy_label)
+            if indiv.shape[1] >= 3:
+                axs[2].plot(t_days_rl, indiv[:, 2], "m", linewidth=1, label=sat_label)
         axs[2].set_ylabel("Rewards")
         axs[2].legend(loc="lower left", fontsize=7)
 
-        axs[3].plot(t_days, ta, color="royalblue", linewidth=1, label="Ta")
-        axq = axs[3].twinx()
-        axq.plot(t_days, qsol, color="gold", linewidth=1, label="Qsol")
+        axs[3].plot(t_days_main, ta, color="royalblue", linewidth=1, label="Ta")
+        axq3 = axs[3].twinx()
+        axq3.plot(t_days_main, qsol, color="gold", linewidth=1, label="Qsol")
         axs[3].set_ylabel("Ta (°C)")
-        axq.set_ylabel("Qsol (W)")
+        axq3.set_ylabel("Qsol (W)")
         axs[3].legend(loc="upper left", fontsize=7)
-        axq.legend(loc="upper right", fontsize=7)
+        axq3.legend(loc="upper right", fontsize=7)
 
-        axs[3].set_xlabel("Temps (jours)")
+        # Nouveau subplot pour les gains internes
+        axs[4].plot(t_days_main, qocc, color="firebrick", linewidth=1, label="Qocc")
+        axs[4].plot(t_days_main, qocr, color="darkred", linewidth=1, label="Qocr")
+        axs[4].set_ylabel("Internal gains (W)")
+        axs[4].legend(loc="upper right", fontsize=7)
+
+        # Subplot minimaliste pour le prix de l'électricité
+        price = np.asarray([dataset_short.d["electricity_price"][i] for i in idx_main], dtype=float)
+        axs[5].plot(t_days_main, price, color="black", linewidth=1)
+        axs[5].set_ylabel("Prix\n(€/kWh)")
+        axs[5].set_xlabel("Temps (jours)")
+
+        # Titre minimaliste avec un indice de l'épisode
+        fig.suptitle(f"Episode: steps={len(self.ep_idx)}, last_idx={self.ep_idx[-1]}")
+
         plt.tight_layout()
-        plt.show(block=False)
-        plt.pause(0.1)
+
+        # Sauvegarde du rollout au lieu d'afficher
+        rollout_dir = Path("rollout")
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        filename = rollout_dir / f"episode_{self._episode_count:04d}_idx_{self.ep_idx[-1]}.png"
+        fig.savefig(filename)
+        plt.close(fig)
 
     def _run_warmup(self, start_idx: int, end_idx: int):
         """Warmup PID entre start_idx et end_idx (inclus),
@@ -378,11 +458,6 @@ class MyMinimalEnv(gym.Env):
 
         # reset état interne PID pour la boucle contrôle RL
         self.current_setpoint = self.t_set
-        
-        # Logs TensorBoard
-        if self.writer and self.ep_rewards:
-            self.writer.add_scalar("episode/return", sum(self.ep_rewards), self._episode_count)
-        
         # Si on enchaîne les épisodes, on peut afficher celui qui vient de finir
         if self.render_episodes and self.ep_idx and not self._episode_plotted and (self._episode_count % 10 == 0):
             self._plot_episode()
@@ -412,9 +487,29 @@ class MyMinimalEnv(gym.Env):
             controller=pid_step,
             x0=self.x,
         )
-        u_hist = np.asarray(controls.get("oveHeaPumY_u", np.zeros((len(time_slice),), dtype=np.float64)), dtype=np.float32)
+        states_arr = np.asarray(states, dtype=np.float32)
+        u_hist = np.asarray(
+            controls.get("oveHeaPumY_u", np.zeros((len(time_slice),), dtype=np.float64)),
+            dtype=np.float32,
+        )
+        delta_sat_hist = np.asarray(
+            controls.get("delta_sat", np.zeros((len(time_slice),), dtype=np.float64)),
+            dtype=np.float32,
+        )
+        x_next = states_arr[-1]
+
+        # 3) Logs fins (≈30 s) pour le plot uniquement
+        tz_traj = states_arr[:, 0]
+        n_inner = min(len(time_slice) - 1, len(u_hist))
+        for k in range(1, n_inner + 1):
+            idx_k = self.idx + k
+            self.ep_idx_30s.append(idx_k)
+            self.ep_tz_30s.append(float(tz_traj[k]))
+            self.ep_u_30s.append(float(u_hist[k - 1]))
+
+        # commande représentative pour le pas RL (dernière)
         u_rl = u_hist[-1:]
-        x_next = np.asarray(states, dtype=np.float32)[-1]
+        delta_rl = delta_sat_hist[-1:]
 
         # 4) Mise à jour des historiques
         self.state_hist[:-1] = self.state_hist[1:]
@@ -422,7 +517,7 @@ class MyMinimalEnv(gym.Env):
 
         self.x = x_next
 
-        # 5) Avancer dans le dataset pour les perturbations
+        # 4) Avancer dans le dataset pour les perturbations
         self.idx += self.step_n
         self.ep_steps = getattr(self, "ep_steps", 0) + 1
 
@@ -446,10 +541,10 @@ class MyMinimalEnv(gym.Env):
         comfort_above = max(tz_curr - upper_sp, 0.0)
         comfort_penalty = -(comfort_below + comfort_above)
         energy_penalty = -1.0 * float(np.clip(u_rl, 0.0, 1.0).mean())
-        reward = comfort_penalty + energy_penalty
+        sat_penalty = -0.005 * float(np.abs(delta_rl).mean())
+        reward = comfort_penalty + energy_penalty + sat_penalty
 
-        self._log_step(self.idx, tz_curr, tz_set, float(u_rl[-1]), reward, (comfort_penalty, energy_penalty))
-        
+        self._log_step(self.idx, tz_curr, tz_set, float(u_rl[-1]), reward, (comfort_penalty, energy_penalty, sat_penalty))
         info = {
             "idx": self.idx,
             "predictive_horizon": self.predictive_horizon,
@@ -462,7 +557,7 @@ class MyMinimalEnv(gym.Env):
         }
 
         if self.render_episodes and (terminated or truncated):
-            if not self._episode_plotted and (self._episode_count % 10 == 0):
+            if not self._episode_plotted and (self._episode_count % 100 == 0):
                 self._plot_episode()
                 self._episode_plotted = True
 
@@ -475,8 +570,7 @@ class MyMinimalEnv(gym.Env):
             self._plot_episode()
 
     def close(self):
-        if self.writer:
-            self.writer.close()
+        pass
 
 
 
@@ -509,25 +603,92 @@ class NormalizeAction(gym.ActionWrapper):
 
 
 if __name__ == "__main__":
+    from stable_baselines3 import PPO, SAC
+    from stable_baselines3.common.vec_env import SubprocVecEnv
+    from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    def make_env():
+        def _init():
+            env = MyMinimalEnv(
+                step_period=3600,
+                predictive_period=24 * 3600,
+                regressive_period=24 * 3600,
+                state_hist_steps=5,
+                warmup_steps=24,
+                render_episodes=True,
+                max_episode_length=24 * 14,
+            )
+            env = NormalizeAction(env)
+            env = Monitor(env)
+            return env
+        return _init
+
+    n_envs = 8  # nombre d'environnements parallèles
+
+    # Vecteur d'envs multi-process
+    venv = SubprocVecEnv([make_env() for _ in range(n_envs)])
+
+    # Normalisation obs + rewards
+    venv = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
+    model = PPO(
+        "MlpPolicy",
+        venv,
+        verbose=1,
+        device="cpu",
+        learning_rate=3e-4,
+        tensorboard_log="tensorboard_logs",
+    )
+
+    model.learn(total_timesteps=3_000_000, tb_log_name="PPO_RC5")
+
+    model.save(f"ppo_rc5_model_{model._total_timesteps}_steps")
+    venv.save("vecnormalize_stats.pkl")
+
+    venv.close()
+
+
+
+if __name__ == "__main__":
     # Petit smoke-test : plusieurs épisodes aléatoires,
     # avec affichage automatique à la fin de chaque épisode
-    env = MyMinimalEnv(
-        step_period=3600,
-        predictive_period=24 * 3600,
-        regressive_period=24 * 3600,
-        state_hist_steps=5,
-        warmup_steps=24,
-        render_episodes=False,      # important pour que _plot_episode soit appelé
-        max_episode_length=24*14, #Pas max par episode
-        #tensorboard_log="agents/MyMinimalEnv_logs",  # logs TensorBoard
-    )
-    env = NormalizeAction(env)
-
-    from stable_baselines3 import PPO
-
-    model = PPO("MlpPolicy", env, verbose=1)
-    model.learn(total_timesteps=10_000)
-
-    env.close()
+    from stable_baselines3 import PPO, SAC
+    from stable_baselines3.common.vec_env import DummyVecEnv
+    from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import VecNormalize
     
-    # Pour visualiser : tensorboard --logdir=agents/MyMinimalEnv_logs
+
+    def make_env():
+        def _init():
+            env = MyMinimalEnv(
+                step_period=3600,
+                predictive_period=24 * 3600,
+                regressive_period=24 * 3600,
+                state_hist_steps=5,
+                warmup_steps=24,
+                render_episodes=True,      # important pour que _plot_episode soit appelé
+                max_episode_length=24 * 14, # Pas max par episode
+            )
+            env = NormalizeAction(env)
+            env = Monitor(env)
+            return env
+
+        return _init
+
+    n_envs = 8  # nombre d'environnements parallèles
+    venv = DummyVecEnv([make_env() for _ in range(n_envs)])
+    venv = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
+    # Logging minimaliste TensorBoard (SB3 gère les scalaires de base)
+    model = PPO(
+        "MlpPolicy",
+        venv,
+        verbose=1,
+        device = 'cpu',
+        tensorboard_log="tensorboard_logs",  # dossier où TensorBoard ira lire
+    )
+    model.learn(total_timesteps=30_000, tb_log_name="PPO_RC5")
+    model.save(f"ppo_rc5_model_{model._total_timesteps}_steps")
+
+    venv.close()
