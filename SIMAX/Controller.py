@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import jax64  # noqa: F401
 import jax.numpy as jnp
@@ -113,6 +113,7 @@ class Controller_PID(Controller):
             "e_prev": jnp.asarray(0.0, dtype=jnp.float64),
             "d_err": jnp.asarray(0.0, dtype=jnp.float64),
             "u_prev": jnp.asarray(0.0, dtype=jnp.float64),
+            "delta_sat": jnp.asarray(0.0, dtype=jnp.float64),
         }
 
     def compute_control(self, *, idx, y_measurements, disturbances, ctrl_state, ST=None, dt=None, forecast=None, W=None):
@@ -122,6 +123,7 @@ class Controller_PID(Controller):
                 "e_prev": jnp.asarray(0.0, dtype=jnp.float64),
                 "d_err": jnp.asarray(0.0, dtype=jnp.float64),
                 "u_prev": jnp.asarray(0.0, dtype=jnp.float64),
+                "delta_sat": jnp.asarray(0.0, dtype=jnp.float64),
             }
         else:
             ctrl_state = dict(ctrl_state)
@@ -148,7 +150,7 @@ class Controller_PID(Controller):
         d_err = jnp.asarray(ctrl_state.get("d_err", 0.0), dtype=jnp.float64)
 
         safe_dt = jnp.where(dt_in == 0.0, jnp.asarray(1.0, dtype=jnp.float64), dt_in)
-        i_next = i_err + err * dt_in
+        i_next = jnp.clip(i_err + err * dt_in, -100.0, 100.0)
         d_next = ((err - e_prev) / safe_dt + d_err) / 2.0
 
         n_val = jnp.asarray(self.n, dtype=jnp.int32)
@@ -161,18 +163,23 @@ class Controller_PID(Controller):
             u_prev_state,
         )
         u = jnp.clip(u_raw, 0.0, 1.0)
+        delta_sat = u_raw - u
 
         ctrl_state["i_err"] = i_next
         ctrl_state["e_prev"] = err
         ctrl_state["d_err"] = d_next
         ctrl_state["u_prev"] = u
+        ctrl_state["delta_sat"] = delta_sat
 
         if self.verbose:
             msg = f"Index : {idx} | Tz : {float(tz):.2f} | Tset : {float(t_set):.2f} | Err : {float(err):.2f} | u : {float(u):.2f}"
             ctrl_state["last_log"] = msg
             print(msg)
 
-        return {"oveHeaPumY_u": u}, ctrl_state
+        return {
+            "oveHeaPumY_u": u,
+            "delta_sat": delta_sat,
+        }, ctrl_state
 
 
 
@@ -243,10 +250,10 @@ def mpc_cost_core(u_window_bloc, x_i, i, setpoints, sim, time_grid, window_size,
     u_window = jnp.repeat(u_window_bloc, n)[:horizon_len]
     u_window = jnp.clip(u_window, 0.0, 1.0)
 
-    # Simulation interne
+    # Simulation interne (JAX)
     x_i = jnp.asarray(x_i, dtype=jnp.float64)
     controller = Controller_constSeq(oveHeaPumY_u=u_window)
-    t, y_sim, _state, _controls = sim_run.run_numpy(time_grid=window_grid, x0=x_i, controller=controller)
+    t, y_sim, _state, _controls = sim_run.run(time_grid=window_grid, x0=x_i, controller=controller)
 
     # Extraction résultats
     y_arr = jnp.asarray(y_sim, dtype=jnp.float64)
@@ -280,20 +287,38 @@ class Controller_MPC(Controller):
     window_size: int
     n: int = 1 # Control every n steps
     W: jnp.ndarray = eqx.field(default_factory=lambda: jnp.asarray([0.2/1000.0, 10.0], dtype=jnp.float64))
+    cost_core: Callable[..., Any] = eqx.field(default=mpc_cost_core, static=True, repr=False)
 
     SetPoints: jnp.ndarray = eqx.field(default_factory=lambda: jnp.asarray([],dtype=jnp.float64))
     i: int = 0
+    _objective_jit: Callable[..., Any] = eqx.field(init=False, repr=False, static=True)
+    _objective_jit_grad: Callable[..., Any] = eqx.field(init=False, repr=False, static=True)
 
     def init_state(self):
         """Initialise l'état MPC."""
         return {"i": 0, "x_i": self.sim.x0, "u_prev": 0.0, "u_window": None}
 
     def __post_init__(self):
-        self._objective_jit = jax.jit(self._objective_bound, static_argnums=(2,))
-        self._objective_jit_grad = jax.jit(grad(self._objective_bound, argnums=0), static_argnums=(2,))
+        objective = type(self)._objective_bound
+        def objective_u_first(u_window_bloc, self_ref, x_i, i, setpoints, W, forecast):
+            return objective(self_ref, u_window_bloc, x_i, i, setpoints, W, forecast)
+
+        objective_grad = eqx.filter_grad(objective_u_first)
+        object.__setattr__(self, "_objective_jit", eqx.filter_jit(objective_u_first))
+        object.__setattr__(self, "_objective_jit_grad", eqx.filter_jit(objective_grad))
 
     def _core_func(self, u_window_bloc, x_i, i, setpoints, forecast):
-        return mpc_cost_core(u_window_bloc, x_i, i, setpoints, self.sim, self.sim.time_grid, self.window_size, self.n, forecast=forecast)
+        return self.cost_core(
+            u_window_bloc,
+            x_i,
+            i,
+            setpoints,
+            self.sim,
+            self.sim.time_grid,
+            self.window_size,
+            self.n,
+            forecast=forecast,
+        )
 
     def _objective_bound(self, u_window_bloc, x_i, i, setpoints, W, forecast):
         costs = self._core_func(u_window_bloc, x_i, i, setpoints, forecast)
@@ -302,16 +327,16 @@ class Controller_MPC(Controller):
     def objective_np(self, u, ctrl_state, W, forecast=None):
         i = int(ctrl_state.get("i", self.i))
         x_i = jnp.asarray(ctrl_state.get("x_i", self.sim.x0), dtype=jnp.float64)
-        setpoints = jnp.asarray(self.SetPoints, dtype=jnp.float64)
+        setpoints = jnp.asarray(ctrl_state.get("setpoints", self.SetPoints), dtype=jnp.float64)
         u_jax = jnp.asarray(u, dtype=jnp.float64)
-        return float(self._objective_jit(u_jax, x_i, i, setpoints, W, forecast))
+        return float(self._objective_jit(u_jax, self, x_i, i, setpoints, W, forecast))
 
     def objective_np_grad(self, u, ctrl_state, W, forecast=None):
         i = int(ctrl_state.get("i", self.i))
         x_i = jnp.asarray(ctrl_state.get("x_i", self.sim.x0), dtype=jnp.float64)
-        setpoints = jnp.asarray(self.SetPoints, dtype=jnp.float64)
+        setpoints = jnp.asarray(ctrl_state.get("setpoints", self.SetPoints), dtype=jnp.float64)
         u_jax = jnp.asarray(u, dtype=jnp.float64)
-        return np.asarray(self._objective_jit_grad(u_jax, x_i, i, setpoints, W, forecast), dtype=np.float64)
+        return np.asarray(self._objective_jit_grad(u_jax, self, x_i, i, setpoints, W, forecast), dtype=np.float64)
 
     def get_forecast_trajectory(self, u_window, x_i, i, forecast=None):
         """
@@ -325,7 +350,7 @@ class Controller_MPC(Controller):
 
 
     # On warmstart avant chaque optim tous les nZOH
-    def warmstart_PID(self, ctrl_state, window_grid, x_i, window_len, end_idx, forecast):
+    def warmstart_PID(self, ctrl_state, window_grid, x_i, window_len, end_idx, forecast, *, i, setpoints):
         """
         Warmstart minimal du MPC à partir d'un PID et/ou du plan MPC précédent.
 
@@ -361,15 +386,15 @@ class Controller_MPC(Controller):
             u_window_prev = ctrl_state["latest_forecast"].get("u_plan_window", None)
 
         # Cas 1 : full PID (premier appel ou pas de plan MPC précédent)
-        if u_window_prev is None or self.i == 0:
+        if u_window_prev is None or int(i) == 0:
             print("WS full PID")
             x0 = jnp.asarray(ctrl_state.get("x_i", x_i), dtype=jnp.float64)
 
-            sp_window = _get_setpoints_window(self.SetPoints, self.i, self.window_size, forecast, window_grid.shape[0], fallback_val=float(x0[0]))
+            sp_window = _get_setpoints_window(setpoints, int(i), self.window_size, forecast, window_grid.shape[0], fallback_val=float(x0[0]))
             controller = Controller_PID(k_p=0.6, k_d=0.0, k_i=0.6 / 800.0, SetPoints=sp_window, n=self.n, verbose=False)
 
-            sim_run, _, _ = _prepare_sim_window(self.sim, self.i, self.window_size, forecast)
-            _, _, _states, control = sim_run.run_numpy(time_grid=window_grid, x0=x0, controller=controller)
+            sim_run, _, _ = _prepare_sim_window(self.sim, int(i), self.window_size, forecast)
+            _, _, _states, control, *_ = sim_run.run_numpy(time_grid=window_grid, x0=x0, controller=controller)
             u_pid = jnp.asarray(control["oveHeaPumY_u"], dtype=jnp.float64)
 
             u_pid_bloc = u_pid[::self.n]
@@ -407,12 +432,17 @@ class Controller_MPC(Controller):
         if ctrl_state is None: ctrl_state = self.init_state()
         else: ctrl_state = dict(ctrl_state)
 
-        if ST is not None: self.SetPoints = jnp.full((len(self.sim.time_grid),), ST, dtype=jnp.float64)
-        if ST_window is not None: self.SetPoints = jnp.asarray(ST_window, dtype=jnp.float64)
+        if ST is not None:
+            setpoints = jnp.full((len(self.sim.time_grid),), ST, dtype=jnp.float64)
+        elif ST_window is not None:
+            setpoints = jnp.asarray(ST_window, dtype=jnp.float64)
+        else:
+            setpoints = jnp.asarray(self.SetPoints, dtype=jnp.float64)
+        ctrl_state["setpoints"] = setpoints
 
         W_arr = jnp.asarray(W if W is not None else self.W, dtype=jnp.float64)
-        self.i = int(idx)
-        ctrl_state["i"] = self.i
+        i = int(idx)
+        ctrl_state["i"] = i
         
         # --- State Estimation ---
         x_prev = ctrl_state.get("x_i")
@@ -424,8 +454,8 @@ class Controller_MPC(Controller):
 
         ctrl_state["y_meas"] = y_measurements
 
-        end_idx = min(self.i + self.window_size, len(self.sim.time_grid))
-        window_grid = self.sim.time_grid[self.i : end_idx]
+        end_idx = min(i + self.window_size, len(self.sim.time_grid))
+        window_grid = self.sim.time_grid[i:end_idx]
 
 
         n = int(getattr(self,"n",1))
@@ -433,15 +463,27 @@ class Controller_MPC(Controller):
         
 
 
-        horizon_len = end_idx - self.i
+        horizon_len = end_idx - i
         window_len = int(np.ceil(horizon_len / max(n, 1)))
         
         # On ne tente un MPC que si on a au moins 2 points de grille
-        recompute = (self.i % n == 0) and (horizon_len >= 2)
+        recompute = (i % n == 0) and (horizon_len >= 2)
 
         if recompute:
             # Warmstart
-            U0 = np.asarray(self.warmstart_PID(ctrl_state, window_grid, x_i, window_len, forecast=forecast, end_idx=end_idx), dtype=np.float64)
+            U0 = np.asarray(
+                self.warmstart_PID(
+                    ctrl_state,
+                    window_grid,
+                    x_i,
+                    window_len,
+                    forecast=forecast,
+                    end_idx=end_idx,
+                    i=i,
+                    setpoints=setpoints,
+                ),
+                dtype=np.float64,
+            )
 
             from scipy.optimize import minimize
             res = minimize(
@@ -460,13 +502,13 @@ class Controller_MPC(Controller):
             ctrl_state["last_cost"] = float(res.fun)
 
             # Forecast trajectory for logging/debugging
-            t_pred, y_pred, x_pred = self.get_forecast_trajectory(u_window, x_i, self.i, forecast)
+            t_pred, y_pred, x_pred = self.get_forecast_trajectory(u_window, x_i, i, forecast)
             ctrl_state["latest_forecast"] = {
                 "time": np.asarray(t_pred),
                 "x_plan_window": np.asarray(x_pred),
                 "y_plan_window": np.asarray(y_pred),
                 "u_plan_window": np.asarray(u_window),
-                "decision_idx": int(self.i),
+                "decision_idx": int(i),
             }
         else:
             u_window = ctrl_state.get("u_window")
@@ -490,7 +532,12 @@ class Controller_MPC(Controller):
         ctrl_state["x_i"] = x_next
 
         u_arr = jnp.asarray(u_mpc, dtype=jnp.float64)
-        tset_display = self.setpoint_value(idx, fallback=float(x_i[0]))
+        if setpoints.size == 0:
+            tset_display = jnp.asarray(float(x_i[0]), dtype=jnp.float64)
+        else:
+            last = max(int(setpoints.shape[0]) - 1, 0)
+            safe_idx = jnp.asarray(jnp.clip(idx, 0, last), dtype=jnp.int32)
+            tset_display = setpoints[safe_idx]
 
         cost = float(ctrl_state.get("last_cost", 0.0))
         msg = (

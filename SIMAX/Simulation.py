@@ -166,13 +166,14 @@ class Simulation_JAX(eqx.Module):
         """Sélectionne le schéma d’intégration à partir de `integrator`."""
         integ = self.integrator
         if integ is None or isinstance(integ, str):
-            name = (integ or "rk4").lower()
+            # Par défaut, on utilise désormais RK2 (Heun) pour un compromis précision/coût
+            name = (integ or "rk2").lower()
             table = {
                 "rk4": self.rk4_step,
                 "rk2": self.rk2_step,  # Heun
                 "euler": self.euler_step,
             }
-            object.__setattr__(self, "integrator", table.get(name, self.rk4_step))
+            object.__setattr__(self, "integrator", table.get(name, self.rk2_step))
 
     def copy(self, **overrides):
         """Crée une copie immuable avec quelques champs remplacés."""

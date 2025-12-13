@@ -120,7 +120,7 @@ class MyMinimalEnv(gym.Env):
         base_setpoint=273.15 + 21.0,
         max_episode_length=100, # nombre max de pas par épisode (None = limité par idx_max)
         render_episodes=False,   # plot auto en fin d'épisode
-        start_week=None,         # si non None, force le début d'épisode sur cette semaine (1 = première)
+        excluding_periods=None,  # liste de (start_s, end_s) en secondes
     ):
         super().__init__()
 
@@ -147,7 +147,6 @@ class MyMinimalEnv(gym.Env):
         self.tz_min = float(tz_min)
         self.tz_max = float(tz_max)
         self.render_episodes = bool(render_episodes)
-        self.start_week = int(start_week) if start_week is not None else None
         # On suppose que max_episode_length est toujours fourni et cohérent
         self.max_episode_length = int(max_episode_length)
         # Paramètres du modèle (theta) utilisés pour la simu
@@ -177,6 +176,8 @@ class MyMinimalEnv(gym.Env):
         )
         self._time_np = np.asarray(dataset_short.time, dtype=np.float64)
 
+        self._excluded_mask = self._build_excluded_mask(excluding_periods)
+
         # Contraintes sur l'indice de début d'épisode (en pas dataset) :
         # - warmup_steps pas RL avant idx pour le warmup PID
         # - future_steps pas RL après idx pour les observations futures + 1 pas RL simulable
@@ -185,7 +186,8 @@ class MyMinimalEnv(gym.Env):
         self.idx_max = self.n - 1 - (self.future_steps + 1) * self.step_n
         # Borne supérieure pour l'indice de début, pour qu'un épisode complet
         # de longueur max_episode_length soit possible (supposé cohérent).
-        self.idx_max_start = self.idx_max - (self.max_episode_length - 1) * self.step_n
+        # On veut pouvoir calculer l'observation après le dernier step sans clamp sur idx_max.
+        self.idx_max_start = self.idx_max - self.max_episode_length * self.step_n
 
         # ---------- dimension de l'observation ----------
         # Fenêtre sur les perturbations agrégées par pas RL (moyenne sur step_n pas dataset) :
@@ -272,6 +274,29 @@ class MyMinimalEnv(gym.Env):
 
     # ---------------------- helpers internes ---------------------- #
 
+    def _build_excluded_mask(self, excluding_periods) -> np.ndarray:
+        """Masque des instants du dataset à exclure.
+
+        `excluding_periods`: liste de tuples (start_s, end_s) en secondes, intervalle [start_s, end_s).
+        """
+        mask = np.zeros((self.n,), dtype=bool)
+        if excluding_periods is None:
+            return mask
+        for period in excluding_periods:
+            if period is None:
+                continue
+            if not isinstance(period, (tuple, list)) or len(period) != 2:
+                raise TypeError("excluding_periods doit être une liste de tuples (start_s, end_s).")
+            start_t, end_t = map(float, period)
+            if end_t < start_t:
+                raise ValueError(f"Période invalide (start > end): {period!r}")
+            start_idx = int(np.searchsorted(self._time_np, start_t, side="left"))
+            end_idx = int(np.searchsorted(self._time_np, end_t, side="left"))
+            start_idx = max(0, min(self.n, start_idx))
+            end_idx = max(0, min(self.n, end_idx))
+            mask[start_idx:end_idx] = True
+        return mask
+
     def _get_band_at(self, idx: int) -> tuple[float, float]:
         """Limites de confort [bas, haut] en Kelvin au pas idx."""
         row = self._dist_matrix[idx]
@@ -333,30 +358,23 @@ class MyMinimalEnv(gym.Env):
 
     def _sample_initial_index(self, rng: np.random.Generator) -> int:
         """Choisit un idx de départ compatible avec warmup + horizons."""
-        # Si une semaine cible est définie, on essaye de démarrer dedans
-        if self.start_week is not None:
-            target = float(self.start_week - 1)  # week_idx est 0‑based dans le dataset
-            week_col = self._dist_matrix[:, 9]
-            candidates = np.where(week_col == target)[0]
-            if candidates.size:
-                candidates = candidates[
-                    (candidates >= self.idx_min) & (candidates <= self.idx_max_start)
-                ]
-            if candidates.size:
-                raw = int(rng.choice(candidates))
-                aligned = raw - ((raw - self.idx_min) % self.step_n)
-                if aligned < self.idx_min:
-                    aligned += self.step_n
-                return min(aligned, self.idx_max_start)
+        for _ in range(10_000):
+            raw = int(rng.integers(self.idx_min, self.idx_max_start + 1))
+            idx = raw - ((raw - self.idx_min) % self.step_n)
+            if idx < self.idx_min:
+                idx += self.step_n
+            idx = min(idx, self.idx_max_start)
 
-        # On borne le tirage à idx_max_start pour garantir qu'un épisode
-        # complet de longueur max_episode_length soit possible.
-        raw = int(rng.integers(self.idx_min, self.idx_max_start + 1))
-        # Aligner sur les multiples de step_n pour des pas complets
-        aligned = raw - ((raw - self.idx_min) % self.step_n)
-        if aligned < self.idx_min:
-            aligned += self.step_n
-        return min(aligned, self.idx_max_start)
+            if self._excluded_mask.any():
+                warmup_start = idx - self.warmup_steps_dataset
+                episode_end = idx + (self.max_episode_length + self.future_steps + 1) * self.step_n
+                if warmup_start < 0 or episode_end > self.n:
+                    continue
+                if self._excluded_mask[warmup_start:episode_end].any():
+                    continue
+
+            return idx
+        raise ValueError("Aucun index de départ valide (excluding_periods trop contraignant).")
 
     # ---------- Hooks à remplir avec SIMAX / PID ---------- #
     def _init_state(self, idx: int) -> np.ndarray:
@@ -663,8 +681,10 @@ class MyMinimalEnv(gym.Env):
         axs[7].set_ylabel("Prix\n(€/kWh)")
         axs[7].set_xlabel("Temps (jours)")
 
-        # Titre minimaliste avec le total de timesteps
-        fig.suptitle(f"total_timestep={self.total_timesteps}")
+        title = f"total_timestep={self.total_timesteps}"
+        if self.theta_idx is not None:
+            title += f" | model={self.theta_idx}"
+        fig.suptitle(title)
 
         plt.tight_layout()
         plt.show(block=False)
@@ -724,8 +744,25 @@ class MyMinimalEnv(gym.Env):
         super().reset(seed=seed)
         rng = np.random.default_rng(seed)
 
-        # Choix d'un instant de début d'épisode
-        self.idx = self._sample_initial_index(rng)
+        # Choix d'un instant de début d'épisode (ou forcé via options)
+        opts = options or {}
+        if "start_time_s" in opts or "start_idx" in opts:
+            if "start_time_s" in opts:
+                t0 = float(opts["start_time_s"])
+                raw = int(np.searchsorted(self._time_np, t0, side="left"))
+            else:
+                raw = int(opts["start_idx"])
+            idx = raw - ((raw - self.idx_min) % self.step_n)
+            if idx < self.idx_min:
+                idx += self.step_n
+            self.idx = min(idx, self.idx_max_start)
+        else:
+            self.idx = self._sample_initial_index(rng)
+        if self._excluded_mask.any():
+            warmup_start = self.idx - self.warmup_steps_dataset
+            episode_end = self.idx + (self.max_episode_length + self.future_steps + 1) * self.step_n
+            if warmup_start < 0 or episode_end > self.n or self._excluded_mask[warmup_start:episode_end].any():
+                raise ValueError("reset: idx incompatible avec excluding_periods pour un épisode complet.")
 
         # Si on enchaîne les épisodes, on peut afficher celui qui vient de finir
         if self.render_episodes and self.ep_idx and not self._episode_plotted and (self._episode_count % 10 == 0):
@@ -858,11 +895,11 @@ class MyMinimalEnv(gym.Env):
 
         if self.idx > self.idx_max:
             self.idx = self.idx_max
-            terminated = True
+            #terminated = True
             truncated = True
 
         if self.ep_steps >= self.max_episode_length:
-            terminated = True
+            #terminated = True
             truncated = True
 
         # Observation à l’instant self.idx
