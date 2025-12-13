@@ -9,6 +9,7 @@ from SIMAX.Controller import Controller_PID
 from utils import RC5_steady_state_sys
 import jax.numpy as jnp
 import equinox as eqx
+from Occup import build_occupancy, occupancy_probability
 
 # Colonnes utilisées dans le dataset
 CONTROL_COLS = ()
@@ -44,19 +45,36 @@ time_seconds = np.asarray(dataset.time, dtype=float)
 hours = (time_seconds / 3600.0) % 24.0
 electricity_price = np.where(
     (hours >= 18.0) & (hours < 22.0),
-    0.4,
+    1.0,
     0.2,
 ).astype(np.float64)
+
+# Ajout d'un scénario d'occupation (0/1)
+occupancy = build_occupancy(time_seconds, seed=0).astype(np.float64)
+
+# Ajout de features temporelles dans le dataset :
+# [week_idx, day_in_week, hour_in_day]
+days = time_seconds / 86400.0
+week_idx = np.floor(days / 7.0).astype(np.float64)        # 0, 1, 2, ...
+day_in_week = np.floor(days % 7.0).astype(np.float64)     # 0..6
+hour_in_day = np.floor(hours).astype(np.float64)          # 0..23
 
 dataset = SimulationDataset(
     time=dataset.time,
     u=dataset.u,
-    d={**dataset.d, "electricity_price": jnp.asarray(electricity_price, dtype=jnp.float64)},
+    d={
+        **dataset.d,
+        "electricity_price": jnp.asarray(electricity_price, dtype=jnp.float64),
+        "occupancy": jnp.asarray(occupancy, dtype=jnp.float64),
+        "week_idx": jnp.asarray(week_idx, dtype=jnp.float64),
+        "day_in_week": jnp.asarray(day_in_week, dtype=jnp.float64),
+        "hour_in_day": jnp.asarray(hour_in_day, dtype=jnp.float64),
+    },
 )
 
 
 
-N = 280_000 #280_000 datas max
+N = 250_000 #280_000 datas max
 n_total = dataset.time.shape[0]
 gamma = min(1.0, N / n_total)      # fraction dans ]0, 1]
 dataset_short = dataset.take_fraction(gamma)
@@ -81,7 +99,8 @@ sim = sim_opti_loaded.copy(
     x0=x0,
     time_grid=dataset_short.time[idx_eq:],
     d=dataset_short.d,
-)
+    integrator="euler",
+    )
 
 
 class MyMinimalEnv(gym.Env):
@@ -92,15 +111,16 @@ class MyMinimalEnv(gym.Env):
         *,
         state_dim=5,          # dimension de l'état de ta simu SIMAX
         step_period=900,         # durée d'un pas en secondes
-        predictive_period=None,  # horizon prédictif (dataset) en secondes
-        regressive_period=None,  # horizon régressif (dataset) en secondes
-        state_hist_steps=10,     # nb d'états passés à garder
-        warmup_steps=50,         # nb de pas de warmup PID
+        past_steps=10,           # nb de pas RL passés à garder
+        future_steps=0,          # nb de pas RL futurs (horizon prédictif)
+        warmup_steps=50,         # nb de pas de warmup PID (approx)
         render_mode=None,
         tz_min=273.15 + 15.0,
         tz_max=273.15 + 30.0,
+        base_setpoint=273.15 + 21.0,
+        max_episode_length=100, # nombre max de pas par épisode (None = limité par idx_max)
         render_episodes=False,   # plot auto en fin d'épisode
-        max_episode_length=None, # nombre max de pas par épisode (None = limité par idx_max)
+        start_week=None,         # si non None, force le début d'épisode sur cette semaine (1 = première)
     ):
         super().__init__()
 
@@ -115,22 +135,24 @@ class MyMinimalEnv(gym.Env):
             raise ValueError("dataset_short.time doit être régulièrement échantillonné.")
         self.dataset_dt = base_dt
         self.step_n = max(1, int(round(self.step_period / self.dataset_dt)))  # nombre d'intervalles dataset par pas RL
-        self.predictive_period = predictive_period
-        self.regressive_period = regressive_period
 
-        self.predictive_horizon = self._to_steps(predictive_period)
-        self.regressive_horizon = self._to_steps(regressive_period)
         self.state_dim = int(state_dim)
-        self.state_hist_steps = int(state_hist_steps)
-        self.warmup_steps = int(warmup_steps)
+        # Horizons exprimés directement en pas RL
+        self.past_steps = max(0, int(past_steps))
+        self.future_steps = max(0, int(future_steps))
+        # Longueur d'historique d'état (en pas RL) = horizon passé
+        self.state_hist_steps = self.past_steps
+        # Warmup suffisamment long pour remplir tout l'historique d'état
+        self.warmup_steps = max(int(warmup_steps), self.state_hist_steps + 1)
         self.tz_min = float(tz_min)
         self.tz_max = float(tz_max)
         self.render_episodes = bool(render_episodes)
-        self.max_episode_length = None if max_episode_length is None else int(max_episode_length)
-
-        # Warmup doit produire assez d'états / commandes pour l'historique
-        if self.warmup_steps < self.state_hist_steps + 1:
-            raise ValueError("warmup_steps doit être >= state_hist_steps+1.")
+        self.start_week = int(start_week) if start_week is not None else None
+        # On suppose que max_episode_length est toujours fourni et cohérent
+        self.max_episode_length = int(max_episode_length)
+        # Paramètres du modèle (theta) utilisés pour la simu
+        self.theta = sim.model.theta
+        self.theta_idx = None
 
         # Longueur du dataset de perturbations (météo, gains internes, etc.)
         self.n = dataset_short.time.shape[0]
@@ -145,35 +167,44 @@ class MyMinimalEnv(gym.Env):
                 np.asarray(dataset_short.d["reaQHeaPumCon_y"], dtype=np.float32),
                 np.asarray(dataset_short.d["LowerSetp[1]"], dtype=np.float32),
                 np.asarray(dataset_short.d["UpperSetp[1]"], dtype=np.float32),
+                np.asarray(dataset_short.d["occupancy"], dtype=np.float32),
+                np.asarray(dataset_short.d["electricity_price"], dtype=np.float32),
+                np.asarray(dataset_short.d["week_idx"], dtype=np.float32),
+                np.asarray(dataset_short.d["day_in_week"], dtype=np.float32),
+                np.asarray(dataset_short.d["hour_in_day"], dtype=np.float32),
             ],
             axis=1,
         )
         self._time_np = np.asarray(dataset_short.time, dtype=np.float64)
 
-        # Contraintes sur l'indice de début d'épisode :
-        # - avoir warmup_steps pas de marge avant
-        # - avoir regressive_horizon pas dans le passé
-        # - avoir predictive_horizon pas dans le futur
+        # Contraintes sur l'indice de début d'épisode (en pas dataset) :
+        # - warmup_steps pas RL avant idx pour le warmup PID
+        # - future_steps pas RL après idx pour les observations futures + 1 pas RL simulable
         self.warmup_steps_dataset = self.warmup_steps * self.step_n
-        self.idx_min = max(self.regressive_horizon, self.warmup_steps_dataset)
-        # idx_max garantit : fenêtre future dispo + un pas complet simulable
-        self.idx_max = self.n - 1 - self.predictive_horizon - self.step_n
-        if self.idx_max <= self.idx_min:
-            raise ValueError(
-                f"Horizons/warmup trop grands pour la taille du dataset : "
-                f"n={self.n}, regressive={self.regressive_horizon}, "
-                f"predictive={self.predictive_horizon}, warmup_steps={self.warmup_steps_dataset}"
-            )
+        self.idx_min = self.warmup_steps_dataset
+        self.idx_max = self.n - 1 - (self.future_steps + 1) * self.step_n
+        # Borne supérieure pour l'indice de début, pour qu'un épisode complet
+        # de longueur max_episode_length soit possible (supposé cohérent).
+        self.idx_max_start = self.idx_max - (self.max_episode_length - 1) * self.step_n
 
         # ---------- dimension de l'observation ----------
-        # Fenêtre sur les perturbations du dataset : Ta, qsol, qocc, qocr, qcd, lower_sp, upper_sp
-        self.n_features = 7
-        self.n_past = self.regressive_horizon + 1     # t-h, ..., t
-        self.n_fut = self.predictive_horizon          # t+1, ..., t+H
-        self.n_hist_total = self.n_past + self.n_fut
-        dist_dim = self.n_features * self.n_hist_total
+        # Fenêtre sur les perturbations agrégées par pas RL (moyenne sur step_n pas dataset) :
+        # colonnes = [Ta, qsol, qocc, qocr, qcd, lower_sp, upper_sp, occupancy, price,
+        #             week_idx, day_in_week, hour_in_day]
+        # - passé/présent : 9 perturbations + 3 features de temps = 12
+        # - futur        : 6 perturbations (Ta, Qsol, Qocc, Qocr, Lower/Upper, sans Qcd/occup/price) + 3 temps = 9
+        # Qcd côté passé/présent est remplacé par la puissance HP simulée.
+        self.n_phys_features_past = 9
+        self.n_phys_features_future = 6
+        self.n_time_features = 3
+        self.n_features_past = self.n_phys_features_past + self.n_time_features     # 12
+        self.n_features_future = self.n_phys_features_future + self.n_time_features # 9
+        # Fenêtre passée/future exprimée en pas RL
+        past_len = self.past_steps + 1       # t-K, ..., t (K = past_steps)
+        fut_len = self.future_steps          # t+1, ..., t+H (H = future_steps)
+        dist_dim = self.n_features_past * past_len + self.n_features_future * fut_len
 
-        # Historique des états : on ne garde que Tz (x[0])
+        # Historique des états observés : on ne garde que Tz (moyenne par pas RL)
         tz_hist_dim = (self.state_hist_steps + 1) * 1
 
         # Historique des setpoints (même longueur que l'historique de Tz)
@@ -190,15 +221,10 @@ class MyMinimalEnv(gym.Env):
         )
 
         self.render_mode = render_mode
+        self.t_set = float(base_setpoint)
 
-        self.t_set = 273.15 + 21.0
-
-        # Buffers d'historique (remplis au reset via warmup)
-        self.state_hist = np.zeros(
-            (self.state_hist_steps + 1, self.state_dim), dtype=np.float32
-        )
-
-        # Historique des setpoints
+        # Historique de Tz (moyenne par pas RL) et des setpoints
+        self.tz_hist = np.full((self.state_hist_steps + 1,), self.t_set, dtype=np.float32)
         self.sp_hist = np.full((self.state_hist_steps + 1,), self.t_set, dtype=np.float32)
 
         # État / commande courants de la simu
@@ -208,6 +234,8 @@ class MyMinimalEnv(gym.Env):
         # Index temporel courant dans le dataset
         self.idx = self.idx_min
         self.ep_steps = 0
+        # Compteur global de pas (tous épisodes confondus)
+        self.total_timesteps = 0
 
         # Logs épisode (remplis durant step, pas RL)
         self.ep_idx = []
@@ -221,59 +249,121 @@ class MyMinimalEnv(gym.Env):
         self.ep_idx_30s = []
         self.ep_tz_30s = []
         self.ep_u_30s = []
+        self.ep_qc_30s = []
+        self.ep_qe_30s = []
+        self.ep_php_30s = []
         self._episode_plotted = False
         self._episode_count = 0
+        self.warmup = {
+            "time": np.array([], dtype=float),
+            "tz": np.array([], dtype=float),
+            "u": np.array([], dtype=float),
+            "qc": np.array([], dtype=float),
+            "qe": np.array([], dtype=float),
+            "php": np.array([], dtype=float),
+            "idx": (0, 0),
+        }
+        self._sim_qc = np.full((self.n,), np.nan, dtype=np.float32)
+        self._sim_qe = np.full((self.n,), np.nan, dtype=np.float32)
+        self._sim_php = np.full((self.n,), np.nan, dtype=np.float32)
 
         # Cache de PID pour éviter de recréer des contrôleurs (même structure = pas de recompilation)
         self._pid_cache: dict[int, Controller_PID] = {}
 
     # ---------------------- helpers internes ---------------------- #
-    def _to_steps(self, period):
-        if period is None:
-            return 0
-        steps = int(round(float(period) / self.dataset_dt))
-        return max(0, steps)
-
-    def _get_features_at(self, idx: int) -> np.ndarray:
-        """Retourne [Ta, qsol, qocc, qocr, qcd, lower_sp, upper_sp] au pas idx."""
-        return self._dist_matrix[idx]
 
     def _get_band_at(self, idx: int) -> tuple[float, float]:
         """Limites de confort [bas, haut] en Kelvin au pas idx."""
         row = self._dist_matrix[idx]
         return float(row[5]), float(row[6])
 
+    def _aggregate_step_features(self, start_idx: int) -> np.ndarray:
+        """Retourne la moyenne des perturbations/temps sur un pas RL (step_n points dataset)."""
+        start_idx = int(start_idx)
+        end_idx = min(start_idx + self.step_n, self.n)
+        rows = self._dist_matrix[start_idx:end_idx]
+        # Remplacer Qcd dataset par la puissance HP simulée si dispo
+        php_sim = self._sim_php[start_idx:end_idx]
+        if np.any(~np.isnan(php_sim)):
+            rows = rows.copy()
+            mask = ~np.isnan(php_sim)
+            rows[mask, 4] = php_sim[mask]
+        if rows.size == 0:
+            # Ne devrait pas arriver si idx_min/idx_max sont corrects
+            return np.zeros((self.n_features_past,), dtype=np.float32)
+        return rows.mean(axis=0)
+
     def _build_disturbance_window(self, idx: int) -> np.ndarray:
-        """Fenêtre [passé, présent, futur] sur les perturbations du dataset."""
-        start = idx - self.regressive_horizon
-        end = idx + 1 + self.predictive_horizon
-        window = self._dist_matrix[start:end]
-        return window.reshape(-1)
+        """Fenêtre [passé, présent, futur] sur les perturbations/temps, agrégées par pas RL."""
+        # Passé + présent : (past_steps+1) pas RL (t-K, ..., t)
+        past_feats = []
+        first_start = idx - self.past_steps * self.step_n
+        past_len = self.past_steps + 1
+        for k in range(past_len):
+            start_k = first_start + k * self.step_n
+            past_feats.append(self._aggregate_step_features(start_k))
+        past = np.stack(past_feats, axis=0)  # (n_past, 12)
+
+        # Futur : n_fut pas RL (t+1, ..., t+H), sans occupancy/price/Qcd mais avec le temps
+        future_list = []
+        for k in range(1, self.future_steps + 1):
+            start_k = idx + k * self.step_n
+            full = self._aggregate_step_features(start_k)  # (12,)
+            phys = np.concatenate(
+                [full[:4], full[5:7]], axis=0
+            )  # Ta, qsol, qocc, qocr, lower, upper (sans Qcd futur)
+            time_feats = full[self.n_phys_features_past:]  # week_idx, day_in_week, hour_in_day
+            future_list.append(np.concatenate([phys, time_feats], axis=0))  # (9,)
+
+        if future_list:
+            future = np.stack(future_list, axis=0)  # (n_fut, 10)
+            return np.concatenate(
+                [past.reshape(-1), future.reshape(-1)],
+                axis=0,
+            )
+        return past.reshape(-1)
 
     def _build_observation(self) -> np.ndarray:
         """Concatène : [fenêtre perturbations][hist Tz][hist setpoints]."""
         dist = self._build_disturbance_window(self.idx)
-        tz_hist = self.state_hist[:, 0:1]
-        x_hist_flat = tz_hist.reshape(-1)
+        tz_hist_flat = self.tz_hist.reshape(-1)
         sp_hist_flat = self.sp_hist.reshape(-1)
-        obs = np.concatenate([dist, x_hist_flat, sp_hist_flat], axis=0)
+        obs = np.concatenate([dist, tz_hist_flat, sp_hist_flat], axis=0)
         return obs.astype(np.float32)
 
     def _sample_initial_index(self, rng: np.random.Generator) -> int:
         """Choisit un idx de départ compatible avec warmup + horizons."""
-        raw = int(rng.integers(self.idx_min, self.idx_max + 1))
+        # Si une semaine cible est définie, on essaye de démarrer dedans
+        if self.start_week is not None:
+            target = float(self.start_week - 1)  # week_idx est 0‑based dans le dataset
+            week_col = self._dist_matrix[:, 9]
+            candidates = np.where(week_col == target)[0]
+            if candidates.size:
+                candidates = candidates[
+                    (candidates >= self.idx_min) & (candidates <= self.idx_max_start)
+                ]
+            if candidates.size:
+                raw = int(rng.choice(candidates))
+                aligned = raw - ((raw - self.idx_min) % self.step_n)
+                if aligned < self.idx_min:
+                    aligned += self.step_n
+                return min(aligned, self.idx_max_start)
+
+        # On borne le tirage à idx_max_start pour garantir qu'un épisode
+        # complet de longueur max_episode_length soit possible.
+        raw = int(rng.integers(self.idx_min, self.idx_max_start + 1))
         # Aligner sur les multiples de step_n pour des pas complets
         aligned = raw - ((raw - self.idx_min) % self.step_n)
         if aligned < self.idx_min:
             aligned += self.step_n
-        return min(aligned, self.idx_max)
+        return min(aligned, self.idx_max_start)
 
     # ---------- Hooks à remplir avec SIMAX / PID ---------- #
     def _init_state(self, idx: int) -> np.ndarray:
         """Construit un état initial pour la simu au temps `idx`."""
-        feats = self._get_features_at(idx)
-        ta, qsol, qocc, qocr, qcd = map(float, feats[:5])
-        x_init = RC5_steady_state_sys(ta, qsol, qocc, qocr, qcd, sim.model.theta)
+        row = self._dist_matrix[int(idx)]
+        ta, qsol, qocc, qocr, qcd = map(float, row[:5])
+        x_init = RC5_steady_state_sys(ta, qsol, qocc, qocr, qcd, self.theta)
         return np.asarray(x_init, dtype=np.float32)
 
     def _make_pid(self, setpoint: float, horizon_len: int) -> Controller_PID:
@@ -299,6 +389,9 @@ class MyMinimalEnv(gym.Env):
         self.ep_idx_30s.clear()
         self.ep_tz_30s.clear()
         self.ep_u_30s.clear()
+        self.ep_qc_30s.clear()
+        self.ep_qe_30s.clear()
+        self.ep_php_30s.clear()
 
     def _log_step(self, idx: int, tz: float, setpoint: float, u: float, reward: float, indiv_reward):
         self.ep_idx.append(idx)
@@ -323,34 +416,74 @@ class MyMinimalEnv(gym.Env):
         plt.ion()
         fig = plt.gcf()
         fig.clear()
-        fig.set_dpi(150)
-        axs = fig.subplots(6, 1, sharex=True)
-        fig.set_size_inches(10, 10, forward=True)
+        # Figure en 4/3, 200 dpi
+        fig.set_dpi(200)
+        # 8 subplots de données (sans panneau texte pour les paramètres)
+        axs = fig.subplots(
+            8,
+            1,
+            sharex=True,
+            gridspec_kw={"height_ratios": [2, 1, 1, 1, 1, 1, 1, 1]},
+        )
+        fig.set_size_inches(12, 9, forward=True)
         # Grille fine (≈30 s) pour Tz/u si dispo, sinon pas RL
         if self.ep_idx_30s:
             idx_main = np.asarray(self.ep_idx_30s, dtype=int)
             t_days_main = self._time_np[idx_main] / 86400.0
             tz_c = np.asarray(self.ep_tz_30s, dtype=float) - 273.15
             u_arr = np.asarray(self.ep_u_30s, dtype=float)
+            qc_arr = np.asarray(self.ep_qc_30s, dtype=float)
+            qe_arr = np.asarray(self.ep_qe_30s, dtype=float)
+            php_arr = np.asarray(self.ep_php_30s, dtype=float)
         else:
             idx_main = np.asarray(self.ep_idx, dtype=int)
             t_days_main = np.asarray(self.ep_time, dtype=float) / 86400.0
             tz_c = np.asarray(self.ep_tz, dtype=float) - 273.15
             u_arr = np.asarray(self.ep_control, dtype=float)
+            qc_arr = np.asarray(self._sim_qc[idx_main], dtype=float)
+            qe_arr = np.asarray(self._sim_qe[idx_main], dtype=float)
+            php_arr = np.asarray(self._sim_php[idx_main], dtype=float)
 
-        lower_c = np.asarray([self._dist_matrix[i, 5] for i in idx_main], dtype=float) - 273.15
-        upper_c = np.asarray([self._dist_matrix[i, 6] for i in idx_main], dtype=float) - 273.15
-        ta = np.asarray([dataset_short.d["weaSta_reaWeaTDryBul_y"][i] for i in idx_main], dtype=float) - 273.15
-        qsol = np.asarray([dataset_short.d["weaSta_reaWeaHGloHor_y"][i] for i in idx_main], dtype=float)
-        qocc = np.asarray([dataset_short.d["InternalGainsCon[1]"][i] for i in idx_main], dtype=float)
-        qocr = np.asarray([dataset_short.d["InternalGainsRad[1]"][i] for i in idx_main], dtype=float)
+        rows = self._dist_matrix[idx_main]
+        lower_c = rows[:, 5].astype(float) - 273.15
+        upper_c = rows[:, 6].astype(float) - 273.15
+        ta = rows[:, 0].astype(float) - 273.15
+        qsol = rows[:, 1].astype(float)
+        qocc = rows[:, 2].astype(float)
+        qocr = rows[:, 3].astype(float)
+        occ = rows[:, 7].astype(float)
+        prob = occupancy_probability(self._time_np[idx_main])
 
         # Setpoint / rewards restent au pas RL
         t_days_rl = np.asarray(self.ep_time, dtype=float) / 86400.0
         sp_rl = np.asarray(self.ep_setpoint, dtype=float) - 273.15
-        sp_c = np.interp(t_days_main, t_days_rl, sp_rl)
         rewards = np.asarray(self.ep_rewards, dtype=float)
         indiv = np.asarray(self.ep_indiv_rewards, dtype=float) if self.ep_indiv_rewards else None
+
+        # Bande warmup (toutes courbes) + données warmup
+        warm = self.warmup
+        warm_time = warm["time"]
+        warm_tz = warm["tz"]
+        warm_u = warm["u"]
+        warm_qc = warm.get("qc", np.array([], dtype=float))
+        warm_qe = warm.get("qe", np.array([], dtype=float))
+        warm_php = warm.get("php", np.array([], dtype=float))
+        has_warmup = warm_time.size > 0
+        warmup_span = None
+        if has_warmup:
+            warmup_span = (float(warm_time[0]), float(warm_time[-1]))
+            i0, i1 = warm["idx"]
+            warm_rows = self._dist_matrix[i0 : i1 + 1]
+            w_lower_c = warm_rows[:, 5].astype(float) - 273.15
+            w_upper_c = warm_rows[:, 6].astype(float) - 273.15
+            w_ta = warm_rows[:, 0].astype(float) - 273.15
+            w_qsol = warm_rows[:, 1].astype(float)
+            w_qocc = warm_rows[:, 2].astype(float)
+            w_qocr = warm_rows[:, 3].astype(float)
+            w_occ = warm_rows[:, 7].astype(float)
+            w_price = warm_rows[:, 8].astype(float)
+            w_sp = np.full_like(warm_time, self.t_set - 273.15, dtype=float)
+            w_prob = occupancy_probability(self._time_np[i0 : i1 + 1])
 
         # Légendes avec parts en pourcentage des sous-récompenses
         reward_label = "reward"
@@ -371,55 +504,171 @@ class MyMinimalEnv(gym.Env):
             energy_label = f"energy ({energy_pct:.0f}%)"
             sat_label = f"sat ({sat_pct:.0f}%)"
 
-        axs[0].fill_between(t_days_main, lower_c, upper_c, color="palegreen", alpha=0.3, label="Bande confort")
-        axs[0].plot(t_days_main, sp_c, "--", color="gray", linewidth=1, label="Setpoint")
+        if warmup_span:
+            # Bande warmup sur tous les subplots temporels
+            for ax in axs:
+                ax.axvspan(warmup_span[0], warmup_span[1], color="khaki", alpha=0.15, zorder=0)
+            axs[0].plot([warmup_span[0]], [np.nan], color="khaki", alpha=0.3, linewidth=6, label="warmup")
+
+        # Bande de confort : uniquement les bornes, en pointillés
+        axs[0].plot(t_days_main, lower_c, "--", color="seagreen", linewidth=1, label="Bande confort")
+        axs[0].plot(t_days_main, upper_c, "--", color="seagreen", linewidth=1)
+        if has_warmup:
+            axs[0].plot(warm_time, w_sp, "-", color="gray", linewidth=1, alpha=0.8, label="warmup setpoint")
+            axs[0].plot(warm_time, warm_tz, "-", color="darkorange", alpha=0.8, label="warmup Tz")
+        axs[0].step(t_days_rl, sp_rl, where="post", color="gray", linewidth=1, label="Setpoint")
         axs[0].plot(t_days_main, tz_c, "-", color="darkorange", linewidth=1, label="Tz")
         axs[0].set_ylabel("Tz / setpoint\n(°C)")
-        axs[0].legend(fontsize=7)
 
         axs[1].plot(t_days_main, u_arr, "-", color="slateblue", linewidth=1)
+        if has_warmup and warm_u.size:
+            n = min(warm_u.size, warm_time.size)
+            axs[1].plot(warm_time[:n], warm_u[:n], "-", color="slateblue", alpha=0.7)
         axs[1].set_ylabel("Commande\n(-)")
 
-        axs[2].plot(t_days_rl, rewards, "b", linewidth=1, label=reward_label)
-        if indiv is not None:
-            axs[2].plot(t_days_rl, indiv[:, 0], "r", linewidth=1, label=comfort_label)
-            axs[2].plot(t_days_rl, indiv[:, 1], "g", linewidth=1, label=energy_label)
-            if indiv.shape[1] >= 3:
-                axs[2].plot(t_days_rl, indiv[:, 2], "m", linewidth=1, label=sat_label)
-        axs[2].set_ylabel("Rewards")
-        axs[2].legend(loc="lower left", fontsize=7)
+        axs[2].plot(t_days_main, qc_arr, "-", color="teal", linewidth=1, label="Qc")
+        axs[2].plot(t_days_main, qe_arr, "-", color="darkcyan", linewidth=1, label="Qe")
+        axs[2].plot(t_days_main, php_arr, "-", color="black", linewidth=1, label="P_hp")
+        if has_warmup:
+            axs[2].plot(warm_time, warm_qc, "-", color="teal", linewidth=1, alpha=0.7)
+            axs[2].plot(warm_time, warm_qe, "-", color="darkcyan", linewidth=1, alpha=0.7)
+            axs[2].plot(warm_time, warm_php, "-", color="black", linewidth=1, alpha=0.7)
+        axs[2].set_ylabel("Q (W)")
+        axs[2].legend(loc="upper right", fontsize=7)
 
-        axs[3].plot(t_days_main, ta, color="royalblue", linewidth=1, label="Ta")
-        axq3 = axs[3].twinx()
+        axs[3].plot(t_days_rl, rewards, "b", linewidth=1, label=reward_label)
+        if indiv is not None:
+            axs[3].plot(t_days_rl, indiv[:, 0], "r", linewidth=1, label=comfort_label)
+            axs[3].plot(t_days_rl, indiv[:, 1], "g", linewidth=1, label=energy_label)
+            if indiv.shape[1] >= 3:
+                axs[3].plot(t_days_rl, indiv[:, 2], "m", linewidth=1, label=sat_label)
+        axs[3].set_ylabel("Rewards")
+        axs[3].legend(loc="lower left", fontsize=7)
+
+        axs[4].plot(t_days_main, ta, color="royalblue", linewidth=1, label="Ta")
+        if has_warmup:
+            axs[4].plot(warm_time, w_ta, "-", color="royalblue", linewidth=1, alpha=0.7)
+        axq3 = axs[4].twinx()
         axq3.plot(t_days_main, qsol, color="gold", linewidth=1, label="Qsol")
-        axs[3].set_ylabel("Ta (°C)")
+        if has_warmup:
+            axq3.plot(warm_time, w_qsol, "-", color="gold", linewidth=1, alpha=0.7)
+        axs[4].set_ylabel("Ta (°C)")
         axq3.set_ylabel("Qsol (W)")
-        axs[3].legend(loc="upper left", fontsize=7)
+        axs[4].legend(loc="upper left", fontsize=7)
         axq3.legend(loc="upper right", fontsize=7)
 
         # Nouveau subplot pour les gains internes
-        axs[4].plot(t_days_main, qocc, color="firebrick", linewidth=1, label="Qocc")
-        axs[4].plot(t_days_main, qocr, color="darkred", linewidth=1, label="Qocr")
-        axs[4].set_ylabel("Internal gains (W)")
-        axs[4].legend(loc="upper right", fontsize=7)
+        axs[5].plot(t_days_main, qocc, color="firebrick", linewidth=1, label="Qocc")
+        axs[5].plot(t_days_main, qocr, color="darkred", linewidth=1, label="Qocr")
+        if has_warmup:
+            axs[5].plot(warm_time, w_qocc, "-", color="firebrick", linewidth=1, alpha=0.7)
+            axs[5].plot(warm_time, w_qocr, "-", color="darkred", linewidth=1, alpha=0.7)
+        axs[5].set_ylabel("Internal gains (W)")
+        axs[5].legend(loc="upper right", fontsize=7)
+
+        # Subplot pour l'occupation (0/1) + profil déterministe
+        axs[6].step(t_days_main, occ, where="post", color="black", linewidth=1)
+        axs[6].plot(t_days_main, prob, color="red", linewidth=0.8)
+        if has_warmup:
+            axs[6].step(warm_time, w_occ, where="post", color="black", linewidth=1, alpha=0.7)
+            axs[6].plot(warm_time, w_prob, color="red", linewidth=0.8, alpha=0.7)
+        axs[6].set_ylabel("Occup\n(-)")
 
         # Subplot minimaliste pour le prix de l'électricité
-        price = np.asarray([dataset_short.d["electricity_price"][i] for i in idx_main], dtype=float)
-        axs[5].plot(t_days_main, price, color="black", linewidth=1)
-        axs[5].set_ylabel("Prix\n(€/kWh)")
-        axs[5].set_xlabel("Temps (jours)")
+        price = rows[:, 8].astype(float)
 
-        # Titre minimaliste avec un indice de l'épisode
-        fig.suptitle(f"Episode: steps={len(self.ep_idx)}, last_idx={self.ep_idx[-1]}")
+        # Mise en évidence (bandes pastel) des périodes où
+        # - le prix est maximal
+        # - l'espérance d'occupation (probabilité) est minimale
+        t_main = t_days_main
+
+        # Prix maximal
+        mask_max = None
+        if price.size > 0:
+            p_max = price.max()
+            mask_max = np.isclose(price, p_max, rtol=1e-5, atol=1e-8)
+            if mask_max.any():
+                idx_max = np.where(mask_max)[0]
+                start = idx_max[0]
+                prev = idx_max[0]
+                first_span_price = True
+                for k in idx_max[1:]:
+                    if k == prev + 1:
+                        prev = k
+                    else:
+                        axs[0].axvspan(
+                            t_main[start],
+                            t_main[prev],
+                            color="lightcoral",
+                            alpha=0.18,
+                            zorder=0,
+                            label="Prix max" if first_span_price else None,
+                        )
+                        first_span_price = False
+                        start = prev = k
+                    prev = k
+                axs[0].axvspan(
+                    t_main[start],
+                    t_main[prev],
+                    color="lightcoral",
+                    alpha=0.18,
+                    zorder=0,
+                    label="Prix max" if first_span_price else None,
+                )
+
+        # Occupation minimale basée sur l'espérance (probabilité) : hachures bleues
+        mask_min = None
+        if prob.size > 0:
+            o_min = prob.min()
+            mask_min = np.isclose(prob, o_min, rtol=1e-5, atol=1e-8)
+            if mask_min.any():
+                idx_min = np.where(mask_min)[0]
+                start = idx_min[0]
+                prev = idx_min[0]
+                first_span_occ = True
+                for k in idx_min[1:]:
+                    if k == prev + 1:
+                        prev = k
+                    else:
+                        axs[0].axvspan(
+                            t_main[start],
+                            t_main[prev],
+                            facecolor="cornflowerblue",
+                            edgecolor="cornflowerblue",
+                            alpha=0.25,
+                            hatch="//",
+                            zorder=0,
+                            label="Occ. min" if first_span_occ else None,
+                        )
+                        first_span_occ = False
+                        start = prev = k
+                    prev = k
+                axs[0].axvspan(
+                    t_main[start],
+                    t_main[prev],
+                    facecolor="cornflowerblue",
+                    edgecolor="cornflowerblue",
+                    alpha=0.25,
+                    hatch="//",
+                    zorder=0,
+                    label="Occ. min" if first_span_occ else None,
+                )
+
+        # Légende complète pour le subplot température, incluant bandes
+        axs[0].legend(fontsize=7)
+
+        axs[7].plot(t_days_main, price, color="black", linewidth=1)
+        if has_warmup:
+            axs[7].plot(warm_time, w_price, "-", color="black", linewidth=1, alpha=0.7)
+        axs[7].set_ylabel("Prix\n(€/kWh)")
+        axs[7].set_xlabel("Temps (jours)")
+
+        # Titre minimaliste avec le total de timesteps
+        fig.suptitle(f"total_timestep={self.total_timesteps}")
 
         plt.tight_layout()
-
-        # Sauvegarde du rollout au lieu d'afficher
-        rollout_dir = Path("rollout")
-        rollout_dir.mkdir(parents=True, exist_ok=True)
-        filename = rollout_dir / f"episode_{self._episode_count:04d}_idx_{self.ep_idx[-1]}.png"
-        fig.savefig(filename)
-        plt.close(fig)
+        plt.show(block=False)
+        plt.pause(0.05)
 
     def _run_warmup(self, start_idx: int, end_idx: int):
         """Warmup PID entre start_idx et end_idx (inclus),
@@ -430,19 +679,45 @@ class MyMinimalEnv(gym.Env):
         pid_warm = self._make_pid(self.t_set, len(time_slice))
 
         # Un run complet fournit états et commandes PID sur la fenêtre de warmup
-        _, _, states, controls = sim.run(
+        _, y_seq, states, controls = sim.run(
+            self.theta,
             time_grid=time_slice,
             controller=pid_warm,
             x0=x_init,
         )
 
-        state_traj = np.asarray(states, dtype=np.float32)
-        state_traj_step = state_traj[::self.step_n]
-        if state_traj_step.size == 0 or not np.allclose(state_traj_step[-1], state_traj[-1]):
-            state_traj_step = np.vstack([state_traj_step, state_traj[-1:]])
-
-        self.state_hist = state_traj_step[-(self.state_hist_steps + 1):]
-        self.x = self.state_hist[-1]
+        y_arr = np.asarray(y_seq, dtype=np.float32)
+        tz_traj = y_arr[:, 0]
+        qc_traj = y_arr[:, 1]
+        qe_traj = y_arr[:, 2]
+        php_traj = qc_traj - np.abs(qe_traj)
+        w_time = np.asarray(dataset_short.time[start_idx : end_idx + 1], dtype=float) / 86400.0
+        w_tz = np.asarray(tz_traj, dtype=float) - 273.15
+        w_qc = np.asarray(qc_traj, dtype=float)
+        w_qe = np.asarray(qe_traj, dtype=float)
+        w_php = np.asarray(php_traj, dtype=float)
+        w_u = np.asarray(controls.get("oveHeaPumY_u", np.zeros_like(qc_traj)), dtype=np.float32)
+        self.warmup = {
+            "time": w_time,
+            "tz": w_tz,
+            "u": w_u,
+            "qc": w_qc,
+            "qe": w_qe,
+            "php": w_php,
+            "idx": (int(start_idx), int(end_idx)),
+        }
+        self._sim_qc[start_idx : end_idx + 1] = w_qc[: (end_idx - start_idx + 1)]
+        self._sim_qe[start_idx : end_idx + 1] = w_qe[: (end_idx - start_idx + 1)]
+        self._sim_php[start_idx : end_idx + 1] = w_php[: (end_idx - start_idx + 1)]
+        # Moyenne de Tz sur chaque pas RL du warmup
+        tz_means = [
+            float(tz_traj[k * self.step_n : min((k + 1) * self.step_n, tz_traj.shape[0])].mean())
+            for k in range(self.warmup_steps)
+            if k * self.step_n < tz_traj.shape[0]
+        ]
+        self.tz_hist = np.asarray(tz_means, dtype=np.float32)[-(self.state_hist_steps + 1):]
+        # État interne de la simu = dernier état du warmup
+        self.x = np.asarray(states[-1], dtype=np.float32)
 
     # -------------------------- API Gym --------------------------- #
     def reset(self, *, seed: int | None = None, options=None):
@@ -452,17 +727,21 @@ class MyMinimalEnv(gym.Env):
         # Choix d'un instant de début d'épisode
         self.idx = self._sample_initial_index(rng)
 
-        # Warmup PID sur `warmup_steps` pas avant idx
-        warmup_start = self.idx - self.warmup_steps_dataset
-        self._run_warmup(warmup_start, self.idx)
-
-        # reset état interne PID pour la boucle contrôle RL
-        self.current_setpoint = self.t_set
         # Si on enchaîne les épisodes, on peut afficher celui qui vient de finir
         if self.render_episodes and self.ep_idx and not self._episode_plotted and (self._episode_count % 10 == 0):
             self._plot_episode()
         self._episode_plotted = False
         self._episode_count += 1
+
+        # Warmup PID sur `warmup_steps` pas avant idx (à faire après le plot précédent)
+        warmup_start = self.idx - self.warmup_steps_dataset
+        self._sim_qc.fill(np.nan)
+        self._sim_qe.fill(np.nan)
+        self._sim_php.fill(np.nan)
+        self._run_warmup(warmup_start, self.idx)
+
+        # reset état interne PID pour la boucle contrôle RL
+        self.current_setpoint = self.t_set
         self.sp_hist.fill(self.t_set)
         self._reset_episode_logs()
         self.ep_steps = 0
@@ -471,56 +750,109 @@ class MyMinimalEnv(gym.Env):
         return obs, {}
 
     def step(self, action):
-        # 1) Action RL -> setpoint
-        tz_set = float(np.clip(np.asarray(action).reshape(-1)[0], self.tz_min, self.tz_max))
+        # --- 0) Index de départ sur la grille dataset ---
+        idx_start = self.idx
+
+        # --- 1) Action RL -> setpoint ---
+        tz_set = float(
+            np.clip(
+                np.asarray(action).reshape(-1)[0],
+                self.tz_min,
+                self.tz_max,
+            )
+        )
         self.current_setpoint = tz_set
 
-        # Mettre à jour l'historique des setpoints
+        # Historique des setpoints (une valeur par pas RL)
         self.sp_hist[:-1] = self.sp_hist[1:]
         self.sp_hist[-1] = tz_set
 
-        # 2) PID -> commande physique via SIMAX sur un pas complet (plusieurs sous-intervales dataset)
+        # --- 2) PID -> commande physique via SIMAX sur un pas complet ---
+        # time_slice contient step_n+1 points (step_n intervalles)
         time_slice = dataset_short.time[self.idx : self.idx + self.step_n + 1]
+
         pid_step = self._make_pid(tz_set, len(time_slice))
-        _, _, states, controls = sim.run(
+        t_grid, y_seq, states, controls = sim.run(
+            self.theta,
             time_grid=time_slice,
             controller=pid_step,
             x0=self.x,
         )
-        states_arr = np.asarray(states, dtype=np.float32)
+
+        # Passage en numpy (float32 pour la suite)
+        y_arr      = np.asarray(y_seq,    dtype=np.float32)
+        states_arr = np.asarray(states,   dtype=np.float32)
+
         u_hist = np.asarray(
-            controls.get("oveHeaPumY_u", np.zeros((len(time_slice),), dtype=np.float64)),
+            controls.get(
+                "oveHeaPumY_u",
+                np.zeros((len(time_slice),), dtype=np.float64),
+            ),
             dtype=np.float32,
         )
         delta_sat_hist = np.asarray(
-            controls.get("delta_sat", np.zeros((len(time_slice),), dtype=np.float64)),
+            controls.get(
+                "delta_sat",
+                np.zeros((len(time_slice),), dtype=np.float64),
+            ),
             dtype=np.float32,
         )
+
         x_next = states_arr[-1]
 
-        # 3) Logs fins (≈30 s) pour le plot uniquement
-        tz_traj = states_arr[:, 0]
+        # --- 3) Logs fins (≈30 s) pour le plot uniquement ---
+        # y_arr = [Tz, Qc, Qe, ...]
+        tz_traj = y_arr[:, 0]
+        qc_traj = y_arr[:, 1]
+        qe_traj = y_arr[:, 2]
+        php_traj = qc_traj - np.abs(qe_traj)
+
+        # n_inner = nb de sous-pas effectivement loggés
         n_inner = min(len(time_slice) - 1, len(u_hist))
+
+        # Point initial (t = idx) pour garantir la continuité avec le warmup
+        self.ep_idx_30s.append(self.idx)
+        self.ep_tz_30s.append(float(tz_traj[0]))
+        self.ep_u_30s.append(float(u_hist[0] if len(u_hist) else 0.0))
+        self.ep_qc_30s.append(float(qc_traj[0]))
+        self.ep_qe_30s.append(float(qe_traj[0]))
+        self.ep_php_30s.append(float(php_traj[0]))
+
+        # Points internes (t = idx + 1 ... idx + n_inner)
         for k in range(1, n_inner + 1):
             idx_k = self.idx + k
             self.ep_idx_30s.append(idx_k)
             self.ep_tz_30s.append(float(tz_traj[k]))
             self.ep_u_30s.append(float(u_hist[k - 1]))
+            self.ep_qc_30s.append(float(qc_traj[k]))
+            self.ep_qe_30s.append(float(qe_traj[k]))
+            self.ep_php_30s.append(float(php_traj[k]))
 
-        # commande représentative pour le pas RL (dernière)
-        u_rl = u_hist[-1:]
-        delta_rl = delta_sat_hist[-1:]
+        # Commande / saturation sur tout le pas RL
+        u_rl = u_hist           # gardé pour debug éventuel
+        delta_rl = delta_sat_hist
 
-        # 4) Mise à jour des historiques
-        self.state_hist[:-1] = self.state_hist[1:]
-        self.state_hist[-1] = x_next
+        # Remplir les signaux simulés sur la grille dataset
+        fill_len = min(len(qc_traj), self.n - idx_start)
+        end_fill = idx_start + fill_len
+        self._sim_qc[idx_start:end_fill]  = qc_traj[:fill_len].astype(np.float32)
+        self._sim_qe[idx_start:end_fill]  = qe_traj[:fill_len].astype(np.float32)
+        self._sim_php[idx_start:end_fill] = php_traj[:fill_len].astype(np.float32)
 
+        # --- 4) Mise à jour des historiques (Tz moyen par pas RL) ---
+        tz_mean = float(tz_traj.mean())
+        self.tz_hist[:-1] = self.tz_hist[1:]
+        self.tz_hist[-1] = tz_mean
+
+        # État interne de la simu = dernier état du pas RL
         self.x = x_next
 
-        # 4) Avancer dans le dataset pour les perturbations
+        # Avancer dans le dataset pour les perturbations
         self.idx += self.step_n
         self.ep_steps = getattr(self, "ep_steps", 0) + 1
+        self.total_timesteps = getattr(self, "total_timesteps", 0) + 1
 
+        # --- 5) Gestion des terminaisons / troncatures ---
         terminated = False
         truncated = False
 
@@ -529,26 +861,61 @@ class MyMinimalEnv(gym.Env):
             terminated = True
             truncated = True
 
-        if (self.max_episode_length is not None) and (self.ep_steps >= self.max_episode_length):
+        if self.ep_steps >= self.max_episode_length:
             terminated = True
             truncated = True
 
+        # Observation à l’instant self.idx
         obs = self._build_observation()
         lower_sp, upper_sp = self._get_band_at(self.idx)
 
-        tz_curr = float(self.x[0])
-        comfort_below = max(lower_sp - tz_curr, 0.0)
-        comfort_above = max(tz_curr - upper_sp, 0.0)
-        comfort_penalty = -(comfort_below + comfort_above)
-        energy_penalty = -1.0 * float(np.clip(u_rl, 0.0, 1.0).mean())
-        sat_penalty = -0.005 * float(np.abs(delta_rl).mean())
-        reward = comfort_penalty + energy_penalty + sat_penalty
+        # --- 6) Calcul de la récompense sur le pas RL ---
+        # rows_step : step_n lignes [idx_start ... idx_start+step_n-1]
+        rows_step = self._dist_matrix[np.arange(idx_start, idx_start + self.step_n)]
+        n_step = rows_step.shape[0]
 
-        self._log_step(self.idx, tz_curr, tz_set, float(u_rl[-1]), reward, (comfort_penalty, energy_penalty, sat_penalty))
+        # mêmes points que rows_step (step_n points / intervalles)
+        t_step = np.asarray(time_slice[:-1], dtype=float)
+
+        occ_seq   = rows_step[:, 7]
+        price_seq = rows_step[:, 8]
+
+        # Tz alignée sur les intervalles (on saute le point initial)
+        tz_seq = tz_traj[1 : n_step + 1]
+        lower_seq = rows_step[:, 5]
+        upper_seq = rows_step[:, 6]
+
+        # Confort
+        comfort_dev = np.maximum(lower_seq - tz_seq, 0.0) + np.maximum(tz_seq - upper_seq, 0.0)
+        comfort_penalty = -float(np.trapezoid(comfort_dev * occ_seq, x=t_step))/3600.0 #En Kelvin·h
+        comfort_penalty_price =  5.0*comfort_penalty # 5 €/K·h
+
+        # Énergie (php positif en kW)
+        php_pos_kw = np.maximum(php_traj[:n_step], 0.0) / 1000.0
+        energy_penalty_price = -float(np.trapezoid(price_seq * php_pos_kw, x=t_step / 3600.0))
+
+        # Pénalité de saturation
+        delta_abs = np.abs(delta_rl[:n_step])
+        sat_penalty = -float(np.trapezoid(delta_abs, x=t_step)) # Saturation.seconde
+        sat_penalty_price = 0.2 * sat_penalty/3600  # 0.2 euros par point de saturation*heure
+
+        # Récompense totale en euros
+        reward = comfort_penalty_price + energy_penalty_price + sat_penalty_price
+
+        tz_curr = float(tz_traj[-1])
+
+        # Log du pas RL
+        self._log_step(
+            self.idx,
+            tz_curr,
+            tz_set,
+            float(u_hist[-1]),
+            reward,
+            (comfort_penalty_price, energy_penalty_price, sat_penalty_price),
+        )
+
         info = {
             "idx": self.idx,
-            "predictive_horizon": self.predictive_horizon,
-            "regressive_horizon": self.regressive_horizon,
             "Tz": tz_curr,
             "setpoint": tz_set,
             "ep_steps": self.ep_steps,
@@ -556,22 +923,45 @@ class MyMinimalEnv(gym.Env):
             "upper_band": upper_sp,
         }
 
+        # --- 7) Plot éventuel de l’épisode ---
         if self.render_episodes and (terminated or truncated):
-            if not self._episode_plotted and (self._episode_count % 100 == 0):
+            if not self._episode_plotted and (self._episode_count % 1000 == 0):
                 self._plot_episode()
                 self._episode_plotted = True
 
         return obs, reward, terminated, truncated, info
 
-    def render(self, mode: str = "episodes"):
-        if mode != "episodes":
-            raise NotImplementedError()
-        if self.render_episodes:
-            self._plot_episode()
 
-    def close(self):
-        pass
 
+
+class ResidualActionWrapper(gym.ActionWrapper):
+    """
+    Wrapper pour du RL résiduel : l'agent choisit un delta autour
+    d'une consigne de base, en conservant l'API interne de MyMinimalEnv.
+    """
+
+    def __init__(self, env, base_action: float, max_dev: float):
+        super().__init__(env)
+        assert isinstance(env.action_space, spaces.Box)
+        self.base_action = float(base_action)
+        self.max_dev = float(max_dev)
+        self._low = env.action_space.low.astype(np.float32)
+        self._high = env.action_space.high.astype(np.float32)
+
+        # L'agent voit directement un delta centré en 0
+        self.action_space = spaces.Box(
+            low=-self.max_dev,
+            high=self.max_dev,
+            shape=env.action_space.shape,
+            dtype=np.float32,
+        )
+
+    def action(self, delta):
+        # delta résiduel -> action réelle dans l'espace de MyMinimalEnv
+        delta = np.asarray(delta, dtype=np.float32)
+        delta = np.clip(delta, -self.max_dev, self.max_dev)
+        action_env = self.base_action + delta
+        return np.clip(action_env, self._low, self._high)
 
 
 class NormalizeAction(gym.ActionWrapper):
@@ -603,73 +993,29 @@ class NormalizeAction(gym.ActionWrapper):
 
 
 if __name__ == "__main__":
-    from stable_baselines3 import PPO, SAC
-    from stable_baselines3.common.vec_env import SubprocVecEnv
-    from stable_baselines3.common.monitor import Monitor
-    from stable_baselines3.common.vec_env import VecNormalize
-
-    def make_env():
-        def _init():
-            env = MyMinimalEnv(
-                step_period=3600,
-                predictive_period=24 * 3600,
-                regressive_period=24 * 3600,
-                state_hist_steps=5,
-                warmup_steps=24,
-                render_episodes=True,
-                max_episode_length=24 * 14,
-            )
-            env = NormalizeAction(env)
-            env = Monitor(env)
-            return env
-        return _init
-
-    n_envs = 8  # nombre d'environnements parallèles
-
-    # Vecteur d'envs multi-process
-    venv = SubprocVecEnv([make_env() for _ in range(n_envs)])
-
-    # Normalisation obs + rewards
-    venv = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_obs=10.0)
-
-    model = PPO(
-        "MlpPolicy",
-        venv,
-        verbose=1,
-        device="cpu",
-        learning_rate=3e-4,
-        tensorboard_log="tensorboard_logs",
-    )
-
-    model.learn(total_timesteps=3_000_000, tb_log_name="PPO_RC5")
-
-    model.save(f"ppo_rc5_model_{model._total_timesteps}_steps")
-    venv.save("vecnormalize_stats.pkl")
-
-    venv.close()
-
-
-
-if __name__ == "__main__":
-    # Petit smoke-test : plusieurs épisodes aléatoires,
     # avec affichage automatique à la fin de chaque épisode
     from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.vec_env import DummyVecEnv
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import VecNormalize
     
+    import torch
 
     def make_env():
         def _init():
+            base_sp = 273.15 + 22.0
             env = MyMinimalEnv(
                 step_period=3600,
-                predictive_period=24 * 3600,
-                regressive_period=24 * 3600,
-                state_hist_steps=5,
-                warmup_steps=24,
+                past_steps=2*24,        # 24 h de passé
+                future_steps=24,      # 24 h de futur
+                warmup_steps=3*24,
+                base_setpoint=base_sp,
                 render_episodes=True,      # important pour que _plot_episode soit appelé
                 max_episode_length=24 * 14, # Pas max par episode
             )
+            # Politique constante de base (ici ≈21°C en Kelvin) + delta appris
+            env = ResidualActionWrapper(env, base_action=base_sp, max_dev=5.0)
+            # Optionnel : on renormalise pour SB3 (agent voit [-1, 1])
             env = NormalizeAction(env)
             env = Monitor(env)
             return env
@@ -685,10 +1031,22 @@ if __name__ == "__main__":
         "MlpPolicy",
         venv,
         verbose=1,
+        learning_rate=2e-4,
         device = 'cpu',
         tensorboard_log="tensorboard_logs",  # dossier où TensorBoard ira lire
     )
-    model.learn(total_timesteps=30_000, tb_log_name="PPO_RC5")
-    model.save(f"ppo_rc5_model_{model._total_timesteps}_steps")
+
+
+    # Init de la tête d'action pour partir de delta ≈ 0
+    with torch.no_grad():
+        actor_net = model.policy.action_net
+        actor_net.weight.fill_(0.0)
+        actor_net.bias.fill_(0.0)
+        if hasattr(model.policy, "log_std"):
+            model.policy.log_std.data.fill_(-2.0)
+
+    model.learn(total_timesteps=10_000_000, tb_log_name="PPO_RC5")
+    model.save(f"Pre_ppo_rc5_model_{model._total_timesteps}_steps")
+    venv.save("vecnormalize_stats.pkl")  # pour les stats de normalisation
 
     venv.close()
