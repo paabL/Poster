@@ -7,29 +7,36 @@ import sys
 import numpy as np
 
 from gymRC5 import MyMinimalEnv, NormalizeAction, ResidualActionWrapper
-from rc5_multi_theta import KModelWrapper, build_k_models
+from gymRC5_lstm import MyMinimalEnvLSTM
+from Utils.rc5_multi_theta import KModelWrapper, build_k_models
 
 
 MODEL_PATHS = [
-    Path("Pre_ppo_rc5_1FA_LSTM_2000000_steps.zip"),
+    Path("Pre_ppo_rc5_1FA_LSTM.zip"),
 ]
 VECNORM_PATH = Path("vecnormalize_stats_1FA_LSTM.pkl")
 
 PLOT_PER_KS = True
 KS_INDICES: list[int] | None = None  # ex: [0, 3] ; None = tous
 
-EPISODE_START_TIME_S = 31 * 24 * 3600  # 1er février si t=0 = 1er janvier
+EPISODE_START_TIME_S = 18 * 24 * 3600  # 1er février si t=0 = 1er janvier
 
 N_EPISODES = 1
 DETERMINISTIC = True
 DEVICE = "cpu"
 MAX_STEPS: int | None = None  # cap steps RL (debug)
-KEEP_PLOTS_OPEN = True  # sinon les fenêtres peuvent se fermer à la fin du script
+
+# Baseline: agent constant (consigne fixe)
+constant = True
+CONSTANT_VALUE_C = 25.0  # consigne (°C) (base_setpoint du script)
+KEEP_PLOTS_OPEN = False  # sinon les fenêtres peuvent se fermer à la fin du script
 SAVE_PLOTS = False      # utile si backend headless (Agg)
 AUTO_OPEN_SAVED_PLOTS = False  # robuste: ouvre le dossier `plots/`
 PLOTS_DIR = Path("plots")
 
-PAST_STEPS = 1  # IMPORTANT: doit matcher le modèle/VecNormalize (sinon obs_dim mismatch)
+# IMPORTANT: doit matcher le modèle/VecNormalize (sinon obs_space mismatch)
+# Entraînement (`1FA_LSTM.py`) : MyMinimalEnvLSTM avec past_steps=0 (Dict obs: {now, forecast})
+PAST_STEPS = 0
 FUTURE_STEPS = 12
 WARMUP_STEPS = 4 * 24
 MAX_EPISODE_LENGTH = 24 * 7
@@ -76,12 +83,12 @@ def _make_venv(
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv
 
-    base_sp = 273.15 + 22.0
+    base_sp = 273.15 + 21.0
 
     thetas = build_k_models(KS_PRESETS)
 
     def _make_one(rank: int = 0):
-        env = MyMinimalEnv(
+        env = MyMinimalEnvLSTM(
             step_period=3600,
             past_steps=past_steps,
             future_steps=future_steps,
@@ -182,6 +189,24 @@ def _rollout_one_episode_single_env(*, model, env, vecnorm, deterministic: bool,
             ep_info = dict(info.get("episode", {})) if isinstance(info, dict) else {}
             return {"return": ep_return, "len": ep_len, "monitor": ep_info}
 
+def _rollout_one_episode_single_env_constant(*, env, max_steps: int | None, start_time_s: float):
+    obs, _info = env.reset(seed=0, options={"start_time_s": float(start_time_s)})
+    ep_return = 0.0
+    ep_len = 0
+    action = np.zeros(env.action_space.shape, dtype=np.float32)  # 0 => base_setpoint (=22°C)
+
+    while True:
+        if max_steps is not None and ep_len >= max_steps:
+            return {"return": ep_return, "len": ep_len, "monitor": {}}
+
+        obs, reward, terminated, truncated, info = env.step(action)
+        ep_return += float(reward)
+        ep_len += 1
+        done = bool(terminated or truncated)
+        if done:
+            ep_info = dict(info.get("episode", {})) if isinstance(info, dict) else {}
+            return {"return": ep_return, "len": ep_len, "monitor": ep_info}
+
 
 def _plot_last_episode(venv) -> None:
     cur = venv
@@ -190,6 +215,7 @@ def _plot_last_episode(venv) -> None:
     base = _unwrap_to(cur.envs[0], MyMinimalEnv)
     if base is None:
         raise RuntimeError("Impossible de retrouver MyMinimalEnv (wrappers inattendus).")
+    base.rollout_dir = PLOTS_DIR
     base._plot_episode()
 
 
@@ -242,10 +268,11 @@ if __name__ == "__main__":
                 mon = out.get("monitor", {}) or {}
                 r = mon.get("r", out["return"])
                 l = mon.get("l", out["len"])
-                print(f"ep={ep+1}/{N_EPISODES} return={r:.3f} len={int(l)}")
+                print(f"[rl] ep={ep+1}/{N_EPISODES} return={r:.3f} len={int(l)}")
                 base = _unwrap_to(env, MyMinimalEnv)
                 if base is None:
                     raise RuntimeError("Impossible de retrouver MyMinimalEnv (wrappers inattendus).")
+                base.rollout_dir = PLOTS_DIR
                 base._plot_episode()
                 if SAVE_PLOTS:
                     import matplotlib.pyplot as plt
@@ -256,6 +283,22 @@ if __name__ == "__main__":
                     fig = plt.gcf()
                     fig.canvas.draw()
                     fig.savefig(out_path, dpi=150)
+
+                if constant:
+                    out_c = _rollout_one_episode_single_env_constant(
+                        env=env,
+                        max_steps=MAX_STEPS,
+                        start_time_s=EPISODE_START_TIME_S,
+                    )
+                    mon_c = out_c.get("monitor", {}) or {}
+                    r_c = mon_c.get("r", out_c["return"])
+                    l_c = mon_c.get("l", out_c["len"])
+                    print(f"[const={CONSTANT_VALUE_C:g}C] ep={ep+1}/{N_EPISODES} return={r_c:.3f} len={int(l_c)}")
+                    base = _unwrap_to(env, MyMinimalEnv)
+                    if base is None:
+                        raise RuntimeError("Impossible de retrouver MyMinimalEnv (wrappers inattendus).")
+                    base.rollout_dir = PLOTS_DIR
+                    base._plot_episode()
 
             env.close()
             venv_norm.close()

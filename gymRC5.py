@@ -6,10 +6,19 @@ import pickle
 import matplotlib.pyplot as plt
 from SIMAX.Simulation import SimulationDataset
 from SIMAX.Controller import Controller_PID
-from utils import RC5_steady_state_sys
+from Utils.utils import RC5_steady_state_sys
 import jax.numpy as jnp
 import equinox as eqx
-from Occup import build_occupancy, occupancy_probability
+from Utils.Occup import build_occupancy, occupancy_probability
+from Utils.rc5_cost import (
+    DEFAULT_W_COMFORT_EUR_PER_KH,
+    DEFAULT_W_ENERGY_EUR,
+    DEFAULT_W_SAT_EUR_PER_UNIT_H,
+    interval_reward_and_terms,
+)
+
+# Racine du projet (robuste aux exécutions depuis un sous-dossier, ex: `MPC/`)
+ROOT = Path(__file__).resolve().parent
 
 # Colonnes utilisées dans le dataset
 CONTROL_COLS = ()
@@ -26,7 +35,7 @@ DISTURBANCE_COLS = (
 # ------------------------------------------------------------------
 #  Charger la simulation
 # ------------------------------------------------------------------
-sim_path = Path("Models/sim_opti.pkl")
+sim_path = ROOT / "Models" / "sim_opti.pkl"
 with sim_path.open("rb") as f:
     sim_opti_loaded = pickle.load(f)
 
@@ -34,31 +43,37 @@ with sim_path.open("rb") as f:
 #  Charger le dataset et en prendre au max N points
 # ------------------------------------------------------------------
 dataset = SimulationDataset.from_csv(
-    "datas/train_df.csv",
+    str(ROOT / "datas" / "train_df.csv"),
     control_cols=CONTROL_COLS,
     disturbance_cols=DISTURBANCE_COLS,
 )
 
-# Ajout d'un signal de prix d'électricité (€/kWh) en créneau :
-# 0.4 entre 18h et 22h, 0.2 le reste du temps.
+# Temps (secondes) + composantes utiles
 time_seconds = np.asarray(dataset.time, dtype=float)
-hours = (time_seconds / 3600.0) % 24.0
+hours = (time_seconds / 3600.0) % 24.0          # [0, 24)
+days  = time_seconds / 86400.0
+dow   = days % 7.0                               # day-of-week continu [0, 7)
+
+# Prix élec (créneau)
 electricity_price = np.where(
     (hours >= 18.0) & (hours < 22.0),
     1.0,
     0.2,
 ).astype(np.float64)
 
-# Ajout d'un scénario d'occupation (0/1)
+# Occupation (0/1)
 occupancy = build_occupancy(time_seconds, seed=0).astype(np.float64)
 
-# Ajout de features temporelles dans le dataset :
-# [week_idx, day_in_week, hour_in_day]
-days = time_seconds / 86400.0
-week_idx = np.floor(days / 7.0).astype(np.float64)        # 0, 1, 2, ...
-day_in_week = np.floor(days % 7.0).astype(np.float64)     # 0..6
-hour_in_day = np.floor(hours).astype(np.float64)          # 0..23
+# Temps : on garde week_idx (non cyclique)
+week_idx = np.floor(days / 7.0).astype(np.float64)
 
+# Temps : on remplace day_in_week/hour_in_day par sin/cos cycliques
+hour_sin = np.sin(2.0 * np.pi * hours / 24.0).astype(np.float64)
+hour_cos = np.cos(2.0 * np.pi * hours / 24.0).astype(np.float64)
+dow_sin  = np.sin(2.0 * np.pi * dow   / 7.0 ).astype(np.float64)
+dow_cos  = np.cos(2.0 * np.pi * dow   / 7.0 ).astype(np.float64)
+
+# Reconstruction du dataset avec les features ajoutées
 dataset = SimulationDataset(
     time=dataset.time,
     u=dataset.u,
@@ -66,11 +81,19 @@ dataset = SimulationDataset(
         **dataset.d,
         "electricity_price": jnp.asarray(electricity_price, dtype=jnp.float64),
         "occupancy": jnp.asarray(occupancy, dtype=jnp.float64),
+
+        # on garde week_idx
         "week_idx": jnp.asarray(week_idx, dtype=jnp.float64),
-        "day_in_week": jnp.asarray(day_in_week, dtype=jnp.float64),
-        "hour_in_day": jnp.asarray(hour_in_day, dtype=jnp.float64),
+
+        # cycliques : jour + heure
+        "dow_sin":  jnp.asarray(dow_sin,  dtype=jnp.float64),
+        "dow_cos":  jnp.asarray(dow_cos,  dtype=jnp.float64),
+        "hour_sin": jnp.asarray(hour_sin, dtype=jnp.float64),
+        "hour_cos": jnp.asarray(hour_cos, dtype=jnp.float64),
     },
 )
+
+
 
 
 
@@ -121,6 +144,11 @@ class MyMinimalEnv(gym.Env):
         max_episode_length=100, # nombre max de pas par épisode (None = limité par idx_max)
         render_episodes=False,   # plot auto en fin d'épisode
         excluding_periods=None,  # liste de (start_s, end_s) en secondes
+        w_energy: float = DEFAULT_W_ENERGY_EUR,
+        w_comfort: float = DEFAULT_W_COMFORT_EUR_PER_KH,
+        w_sat: float = DEFAULT_W_SAT_EUR_PER_UNIT_H,
+        w_u: float = 0.0,
+        w_tz: float = 0.0,
     ):
         super().__init__()
 
@@ -149,6 +177,12 @@ class MyMinimalEnv(gym.Env):
         self.render_episodes = bool(render_episodes)
         # On suppose que max_episode_length est toujours fourni et cohérent
         self.max_episode_length = int(max_episode_length)
+        # Reward (euros) : reward = -(wE*energy + wC*comfort + wS*sat)
+        self.w_energy = float(w_energy)
+        self.w_comfort = float(w_comfort)
+        self.w_sat = float(w_sat)
+        self.w_u = float(w_u)
+        self.w_tz = float(w_tz)
         # Paramètres du modèle (theta) utilisés pour la simu
         self.theta = sim.model.theta
         self.theta_idx = None
@@ -157,25 +191,29 @@ class MyMinimalEnv(gym.Env):
         self.n = dataset_short.time.shape[0]
 
         # Cache numpy pour éviter les __getitem__ JAX coûteux dans l'observation
-        self._dist_matrix = np.stack(
-            [
-                np.asarray(dataset_short.d["weaSta_reaWeaTDryBul_y"], dtype=np.float32),
-                np.asarray(dataset_short.d["weaSta_reaWeaHGloHor_y"], dtype=np.float32),
-                np.asarray(dataset_short.d["InternalGainsCon[1]"], dtype=np.float32),
-                np.asarray(dataset_short.d["InternalGainsRad[1]"], dtype=np.float32),
-                np.asarray(dataset_short.d["reaQHeaPumCon_y"], dtype=np.float32),
-                np.asarray(dataset_short.d["LowerSetp[1]"], dtype=np.float32),
-                np.asarray(dataset_short.d["UpperSetp[1]"], dtype=np.float32),
-                np.asarray(dataset_short.d["occupancy"], dtype=np.float32),
-                np.asarray(dataset_short.d["electricity_price"], dtype=np.float32),
-                np.asarray(dataset_short.d["week_idx"], dtype=np.float32),
-                np.asarray(dataset_short.d["day_in_week"], dtype=np.float32),
-                np.asarray(dataset_short.d["hour_in_day"], dtype=np.float32),
-            ],
-            axis=1,
-        )
-        self._time_np = np.asarray(dataset_short.time, dtype=np.float64)
 
+        self._dist_matrix = np.stack(
+    [
+        np.asarray(dataset_short.d["weaSta_reaWeaTDryBul_y"], dtype=np.float32),
+        np.asarray(dataset_short.d["weaSta_reaWeaHGloHor_y"], dtype=np.float32),
+        np.asarray(dataset_short.d["InternalGainsCon[1]"], dtype=np.float32),
+        np.asarray(dataset_short.d["InternalGainsRad[1]"], dtype=np.float32),
+        np.asarray(dataset_short.d["reaQHeaPumCon_y"], dtype=np.float32),
+        np.asarray(dataset_short.d["LowerSetp[1]"], dtype=np.float32),
+        np.asarray(dataset_short.d["UpperSetp[1]"], dtype=np.float32),
+        np.asarray(dataset_short.d["occupancy"], dtype=np.float32),
+        np.asarray(dataset_short.d["electricity_price"], dtype=np.float32),
+
+        # temps
+        np.asarray(dataset_short.d["week_idx"], dtype=np.float32),
+        np.asarray(dataset_short.d["dow_sin"], dtype=np.float32),
+        np.asarray(dataset_short.d["dow_cos"], dtype=np.float32),
+        np.asarray(dataset_short.d["hour_sin"], dtype=np.float32),
+        np.asarray(dataset_short.d["hour_cos"], dtype=np.float32),
+    ],
+    axis=1)
+
+        self._time_np = np.asarray(dataset_short.time, dtype=np.float64)
         self._excluded_mask = self._build_excluded_mask(excluding_periods)
 
         # Contraintes sur l'indice de début d'épisode (en pas dataset) :
@@ -192,15 +230,23 @@ class MyMinimalEnv(gym.Env):
         # ---------- dimension de l'observation ----------
         # Fenêtre sur les perturbations agrégées par pas RL (moyenne sur step_n pas dataset) :
         # colonnes = [Ta, qsol, qocc, qocr, qcd, lower_sp, upper_sp, occupancy, price,
-        #             week_idx, day_in_week, hour_in_day]
-        # - passé/présent : 9 perturbations + 3 features de temps = 12
-        # - futur        : 6 perturbations (Ta, Qsol, Qocc, Qocr, Lower/Upper, sans Qcd/occup/price) + 3 temps = 9
+        #             week_idx, dow_sin, dow_cos, hour_sin, hour_cos]
+        # - passé/présent : 9 perturbations + n_time_features
+        # - futur        : 6 perturbations (Ta, qsol, qocc, qocr, lower/upper, sans qcd/occup/price) + n_time_features
         # Qcd côté passé/présent est remplacé par la puissance HP simulée.
         self.n_phys_features_past = 9
         self.n_phys_features_future = 6
-        self.n_time_features = 3
-        self.n_features_past = self.n_phys_features_past + self.n_time_features     # 12
-        self.n_features_future = self.n_phys_features_future + self.n_time_features # 9
+        self.n_time_features = int(self._dist_matrix.shape[1] - self.n_phys_features_past)
+        if self.n_time_features <= 0:
+            raise ValueError(
+                f"Disturbance matrix invalide: {self._dist_matrix.shape[1]} colonnes (<={self.n_phys_features_past})."
+            )
+        self.n_features_past = self.n_phys_features_past + self.n_time_features
+        if self.n_features_past != self._dist_matrix.shape[1]:
+            raise ValueError(
+                f"Incohérence features: n_features_past={self.n_features_past} vs dist_matrix={self._dist_matrix.shape[1]}."
+            )
+        self.n_features_future = self.n_phys_features_future + self.n_time_features
         # Fenêtre passée/future exprimée en pas RL
         past_len = self.past_steps + 1       # t-K, ..., t (K = past_steps)
         fut_len = self.future_steps          # t+1, ..., t+H (H = future_steps)
@@ -272,6 +318,9 @@ class MyMinimalEnv(gym.Env):
         # Cache de PID pour éviter de recréer des contrôleurs (même structure = pas de recompilation)
         self._pid_cache: dict[int, Controller_PID] = {}
 
+    def set_rollout_dir(self, rollout_dir: str | Path | None) -> None:
+        self.rollout_dir = str(rollout_dir) if rollout_dir is not None else None
+
     # ---------------------- helpers internes ---------------------- #
 
     def _build_excluded_mask(self, excluding_periods) -> np.ndarray:
@@ -327,21 +376,21 @@ class MyMinimalEnv(gym.Env):
         for k in range(past_len):
             start_k = first_start + k * self.step_n
             past_feats.append(self._aggregate_step_features(start_k))
-        past = np.stack(past_feats, axis=0)  # (n_past, 12)
+        past = np.stack(past_feats, axis=0)  # (n_past, n_features_past)
 
         # Futur : n_fut pas RL (t+1, ..., t+H), sans occupancy/price/Qcd mais avec le temps
         future_list = []
         for k in range(1, self.future_steps + 1):
             start_k = idx + k * self.step_n
-            full = self._aggregate_step_features(start_k)  # (12,)
+            full = self._aggregate_step_features(start_k)  # (n_features_past,)
             phys = np.concatenate(
                 [full[:4], full[5:7]], axis=0
             )  # Ta, qsol, qocc, qocr, lower, upper (sans Qcd futur)
-            time_feats = full[self.n_phys_features_past:]  # week_idx, day_in_week, hour_in_day
-            future_list.append(np.concatenate([phys, time_feats], axis=0))  # (9,)
+            time_feats = full[self.n_phys_features_past:]  # week_idx, dow_sin, dow_cos, hour_sin, hour_cos
+            future_list.append(np.concatenate([phys, time_feats], axis=0))  # (n_features_future,)
 
         if future_list:
-            future = np.stack(future_list, axis=0)  # (n_fut, 10)
+            future = np.stack(future_list, axis=0)  # (n_fut, n_features_future)
             return np.concatenate(
                 [past.reshape(-1), future.reshape(-1)],
                 axis=0,
@@ -354,7 +403,14 @@ class MyMinimalEnv(gym.Env):
         tz_hist_flat = self.tz_hist.reshape(-1)
         sp_hist_flat = self.sp_hist.reshape(-1)
         obs = np.concatenate([dist, tz_hist_flat, sp_hist_flat], axis=0)
-        return obs.astype(np.float32)
+        obs = obs.astype(np.float32)
+        expected = int(self.observation_space.shape[0])
+        if obs.shape != (expected,):
+            raise ValueError(
+                f"Observation de taille invalide: got {obs.shape}, expected {(expected,)} "
+                f"(past_steps={self.past_steps}, future_steps={self.future_steps}, n_time_features={self.n_time_features})."
+            )
+        return obs
 
     def _sample_initial_index(self, rng: np.random.Generator) -> int:
         """Choisit un idx de départ compatible avec warmup + horizons."""
@@ -431,11 +487,8 @@ class MyMinimalEnv(gym.Env):
         if not self.ep_idx:
             return
 
-        plt.ion()
-        fig = plt.gcf()
-        fig.clear()
-        # Figure en 4/3, 200 dpi
-        fig.set_dpi(200)
+        plt.ioff()
+        fig = plt.figure(figsize=(12, 9), dpi=200)
         # 8 subplots de données (sans panneau texte pour les paramètres)
         axs = fig.subplots(
             8,
@@ -443,7 +496,6 @@ class MyMinimalEnv(gym.Env):
             sharex=True,
             gridspec_kw={"height_ratios": [2, 1, 1, 1, 1, 1, 1, 1]},
         )
-        fig.set_size_inches(12, 9, forward=True)
         # Grille fine (≈30 s) pour Tz/u si dispo, sinon pas RL
         if self.ep_idx_30s:
             idx_main = np.asarray(self.ep_idx_30s, dtype=int)
@@ -503,7 +555,7 @@ class MyMinimalEnv(gym.Env):
             w_sp = np.full_like(warm_time, self.t_set - 273.15, dtype=float)
             w_prob = occupancy_probability(self._time_np[i0 : i1 + 1])
 
-        # Légendes avec parts en pourcentage des sous-récompenses
+        # Légendes avec parts (%) + contributions (€) des sous-récompenses
         reward_label = "reward"
         comfort_label = "comfort"
         energy_label = "energy"
@@ -517,10 +569,10 @@ class MyMinimalEnv(gym.Env):
             comfort_pct = 100.0 * total_comfort / total_reward_safe
             energy_pct = 100.0 * total_energy / total_reward_safe
             sat_pct = 100.0 * total_sat / total_reward_safe
-            reward_label = f"reward (sum={total_reward:.2f})"
-            comfort_label = f"comfort ({comfort_pct:.0f}%)"
-            energy_label = f"energy ({energy_pct:.0f}%)"
-            sat_label = f"sat ({sat_pct:.0f}%)"
+            reward_label = f"reward (sum={total_reward:.2f}€)"
+            comfort_label = f"comfort ({comfort_pct:.0f}%, {total_comfort:.2f}€)"
+            energy_label = f"energy ({energy_pct:.0f}%, {total_energy:.2f}€)"
+            sat_label = f"sat ({sat_pct:.0f}%, {total_sat:.2f}€)"
 
         if warmup_span:
             # Bande warmup sur tous les subplots temporels
@@ -544,14 +596,10 @@ class MyMinimalEnv(gym.Env):
             axs[1].plot(warm_time[:n], warm_u[:n], "-", color="slateblue", alpha=0.7)
         axs[1].set_ylabel("Commande\n(-)")
 
-        axs[2].plot(t_days_main, qc_arr, "-", color="teal", linewidth=1, label="Qc")
-        axs[2].plot(t_days_main, qe_arr, "-", color="darkcyan", linewidth=1, label="Qe")
         axs[2].plot(t_days_main, php_arr, "-", color="black", linewidth=1, label="P_hp")
         if has_warmup:
-            axs[2].plot(warm_time, warm_qc, "-", color="teal", linewidth=1, alpha=0.7)
-            axs[2].plot(warm_time, warm_qe, "-", color="darkcyan", linewidth=1, alpha=0.7)
             axs[2].plot(warm_time, warm_php, "-", color="black", linewidth=1, alpha=0.7)
-        axs[2].set_ylabel("Q (W)")
+        axs[2].set_ylabel("P_hp (W)")
         axs[2].legend(loc="upper right", fontsize=7)
 
         axs[3].plot(t_days_rl, rewards, "b", linewidth=1, label=reward_label)
@@ -686,9 +734,13 @@ class MyMinimalEnv(gym.Env):
             title += f" | model={self.theta_idx}"
         fig.suptitle(title)
 
-        plt.tight_layout()
-        plt.show(block=False)
-        plt.pause(0.05)
+        fig.tight_layout()
+        rollout_dir_raw = getattr(self, "rollout_dir", None)
+        rollout_dir = Path(rollout_dir_raw) if rollout_dir_raw else (ROOT / "tensorboard_logs" / "rollout")
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        out_path = rollout_dir / f"episode_{self._episode_count:06d}_t{self.total_timesteps:09d}.png"
+        fig.savefig(out_path)
+        plt.close(fig)
 
     def _run_warmup(self, start_idx: int, end_idx: int):
         """Warmup PID entre start_idx et end_idx (inclus),
@@ -922,22 +974,30 @@ class MyMinimalEnv(gym.Env):
         lower_seq = rows_step[:, 5]
         upper_seq = rows_step[:, 6]
 
-        # Confort
-        comfort_dev = np.maximum(lower_seq - tz_seq, 0.0) + np.maximum(tz_seq - upper_seq, 0.0)
-        comfort_penalty = -float(np.trapezoid(comfort_dev * occ_seq, x=t_step))/3600.0 #En Kelvin·h
-        comfort_penalty_price =  5.0*comfort_penalty # 5 €/K·h
-
-        # Énergie (php positif en kW)
-        php_pos_kw = np.maximum(php_traj[:n_step], 0.0) / 1000.0
-        energy_penalty_price = -float(np.trapezoid(price_seq * php_pos_kw, x=t_step / 3600.0))
-
-        # Pénalité de saturation
-        delta_abs = np.abs(delta_rl[:n_step])
-        sat_penalty = -float(np.trapezoid(delta_abs, x=t_step)) # Saturation.seconde
-        sat_penalty_price = 0.2 * sat_penalty/3600  # 0.2 euros par point de saturation*heure
+        u_seq = u_hist[:n_step] if u_hist.shape[0] >= n_step else None
+        reward_np, (comfort_penalty_price, energy_penalty_price, sat_penalty_price) = interval_reward_and_terms(
+            t_step_s=t_step,
+            tz_seq_k=tz_seq,
+            lower_seq_k=lower_seq,
+            upper_seq_k=upper_seq,
+            occ_seq=occ_seq,
+            php_w_seq=php_traj[:n_step],
+            price_seq=price_seq,
+            u_seq=u_seq,
+            delta_sat_seq=delta_rl[:n_step],
+            w_energy=self.w_energy,
+            w_comfort=self.w_comfort,
+            w_sat=self.w_sat,
+            w_u=self.w_u,
+            w_tz=self.w_tz,
+            xp=np,
+        )
 
         # Récompense totale en euros
-        reward = comfort_penalty_price + energy_penalty_price + sat_penalty_price
+        reward = float(reward_np)
+        comfort_penalty_price = float(comfort_penalty_price)
+        energy_penalty_price = float(energy_penalty_price)
+        sat_penalty_price = float(sat_penalty_price)
 
         tz_curr = float(tz_traj[-1])
 
@@ -958,6 +1018,9 @@ class MyMinimalEnv(gym.Env):
             "ep_steps": self.ep_steps,
             "lower_band": lower_sp,
             "upper_band": upper_sp,
+            "w_energy": self.w_energy,
+            "w_comfort": self.w_comfort,
+            "w_sat": self.w_sat,
         }
 
         # --- 7) Plot éventuel de l’épisode ---
