@@ -11,19 +11,20 @@ if str(ROOT) not in sys.path:
 import jax64  # noqa: F401
 import jax.numpy as jnp
 import numpy as np
+import equinox as eqx
 
 from Utils.Occup import occupancy_probability
 from SIMAX.Controller import Controller_MPC, Controller_PID, Controller_constSeq
-from Utils.utils import RC5_steady_state_sys
+from Utils.utils import RC5_steady_state_sys, scale_rc5_building
 from Utils.rc5_cost import interval_components
 from gymRC5 import dataset_short, sim_opti_loaded
 
 # -------------------- Config (aligné test_1FALSTM) --------------------
-START_TIME_S = 31 * 24 * 3600  # 1er février si t=0 = 1er janvier
-WARMUP_DAYS = 3
+START_TIME_S = 28 * 24 * 3600  # 1er février si t=0 = 1er janvier
+WARMUP_DAYS = 4
 EPISODE_DAYS = 7
 
-BASE_SETPOINT_K = 273.15 + 22.0  # warmup PID
+BASE_SETPOINT_K = 273.15 + 21.0  # warmup PID
 MPC_STEP_S = 300                # recompute u toutes les 1h
 MPC_HORIZON_H = 24               # horizon MPC
 INTEGRATOR = "euler"
@@ -32,6 +33,9 @@ INTEGRATOR = "euler"
 # + W[2]*∫u² dt (unit²·h) pour régulariser la commande.
 W = jnp.asarray([1.0, 5.0, 0.05], dtype=jnp.float64)
 OUT_PATH = ROOT / "MPC" / "figures" / "mpc_rc5_week_feb_warmup4.png"
+
+# k : fait évoluer les propriétés du building (scaling des paramètres "th")
+K: dict[str, float] = {"k_size": 1.1, "k_U": 0.9, "k_inf": 1.1, "k_win": 0.9, "k_mass": 1.1}
 
 
 def _window(ds, t0_s: float, t1_s: float) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
@@ -414,6 +418,10 @@ def _plot(
 
 
 def main() -> None:
+    theta_scaled = scale_rc5_building(sim_opti_loaded.model.theta, K)
+    model_scaled = eqx.tree_at(lambda m: m.theta, sim_opti_loaded.model, theta_scaled)
+    sim_building = sim_opti_loaded.copy(model=model_scaled)
+
     if int(dataset_short.time.shape[0]) < 2:
         raise ValueError("dataset_short.time doit contenir au moins deux points.")
     dt_s = float(dataset_short.time[1] - dataset_short.time[0])
@@ -424,7 +432,7 @@ def main() -> None:
     t_warm, d_warm = _window(dataset_short, START_TIME_S - WARMUP_DAYS * 86400, START_TIME_S)
     t_ep, d_ep = _window(dataset_short, START_TIME_S, START_TIME_S + EPISODE_DAYS * 86400)
 
-    theta = sim_opti_loaded.model.theta
+    theta = sim_building.model.theta
     x0_warmup = RC5_steady_state_sys(
         float(d_warm["weaSta_reaWeaTDryBul_y"][0]),
         float(d_warm["weaSta_reaWeaHGloHor_y"][0]),
@@ -434,7 +442,7 @@ def main() -> None:
         theta,
     )
 
-    sim_warmup = sim_opti_loaded.copy(
+    sim_warmup = sim_building.copy(
         x0=x0_warmup,
         time_grid=t_warm,
         d=d_warm,
@@ -450,7 +458,7 @@ def main() -> None:
         + jnp.asarray(d_ep["UpperSetp[1]"], dtype=jnp.float64)
     )
 
-    sim_mpc = sim_opti_loaded.copy(
+    sim_mpc = sim_building.copy(
         x0=x0_mpc,
         time_grid=t_ep,
         d=d_ep,

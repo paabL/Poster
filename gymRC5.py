@@ -56,8 +56,8 @@ dow   = days % 7.0                               # day-of-week continu [0, 7)
 
 # Prix élec (créneau)
 electricity_price = np.where(
-    (hours >= 18.0) & (hours < 22.0),
-    1.0,
+    (hours >= 17.0) & (hours < 23.0),
+    0.5,
     0.2,
 ).astype(np.float64)
 
@@ -97,7 +97,7 @@ dataset = SimulationDataset(
 
 
 
-N = 250_000 #280_000 datas max
+N = 150_000 #280_000 datas max
 n_total = dataset.time.shape[0]
 gamma = min(1.0, N / n_total)      # fraction dans ]0, 1]
 dataset_short = dataset.take_fraction(gamma)
@@ -146,6 +146,7 @@ class MyMinimalEnv(gym.Env):
         excluding_periods=None,  # liste de (start_s, end_s) en secondes
         w_energy: float = DEFAULT_W_ENERGY_EUR,
         w_comfort: float = DEFAULT_W_COMFORT_EUR_PER_KH,
+        comfort_huber_k: float = 0.0,
         w_sat: float = DEFAULT_W_SAT_EUR_PER_UNIT_H,
         w_u: float = 0.0,
         w_tz: float = 0.0,
@@ -180,6 +181,7 @@ class MyMinimalEnv(gym.Env):
         # Reward (euros) : reward = -(wE*energy + wC*comfort + wS*sat)
         self.w_energy = float(w_energy)
         self.w_comfort = float(w_comfort)
+        self.comfort_huber_k = float(comfort_huber_k)
         self.w_sat = float(w_sat)
         self.w_u = float(w_u)
         self.w_tz = float(w_tz)
@@ -514,6 +516,12 @@ class MyMinimalEnv(gym.Env):
             qe_arr = np.asarray(self._sim_qe[idx_main], dtype=float)
             php_arr = np.asarray(self._sim_php[idx_main], dtype=float)
 
+        # Conso (kWh) sur l'épisode (sans warmup) à partir de P_hp (W)
+        if t_days_main.size >= 2:
+            energy_kwh = float(np.trapezoid(np.maximum(php_arr, 0.0) / 1000.0, x=t_days_main * 24.0))
+        else:
+            energy_kwh = 0.0
+
         rows = self._dist_matrix[idx_main]
         lower_c = rows[:, 5].astype(float) - 273.15
         upper_c = rows[:, 6].astype(float) - 273.15
@@ -732,6 +740,7 @@ class MyMinimalEnv(gym.Env):
         title = f"total_timestep={self.total_timesteps}"
         if self.theta_idx is not None:
             title += f" | model={self.theta_idx}"
+        title += f" | conso={energy_kwh:.1f} kWh"
         fig.suptitle(title)
 
         fig.tight_layout()
@@ -987,6 +996,7 @@ class MyMinimalEnv(gym.Env):
             delta_sat_seq=delta_rl[:n_step],
             w_energy=self.w_energy,
             w_comfort=self.w_comfort,
+            comfort_huber_k=self.comfort_huber_k,
             w_sat=self.w_sat,
             w_u=self.w_u,
             w_tz=self.w_tz,
@@ -1020,6 +1030,7 @@ class MyMinimalEnv(gym.Env):
             "upper_band": upper_sp,
             "w_energy": self.w_energy,
             "w_comfort": self.w_comfort,
+            "comfort_huber_k": self.comfort_huber_k,
             "w_sat": self.w_sat,
         }
 

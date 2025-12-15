@@ -12,14 +12,14 @@ from Utils.rc5_multi_theta import KModelWrapper, build_k_models
 
 
 MODEL_PATHS = [
-    Path("Pre_ppo_rc5_1FA_LSTM.zip"),
+    Path("Pre_ppo_rc5_1FA_LSTM_HU.zip"),
 ]
-VECNORM_PATH = Path("vecnormalize_stats_1FA_LSTM.pkl")
+VECNORM_PATH = Path("vecnormalize_stats_1FA_LSTM_HU.pkl")
 
 PLOT_PER_KS = True
 KS_INDICES: list[int] | None = None  # ex: [0, 3] ; None = tous
 
-EPISODE_START_TIME_S = 18 * 24 * 3600  # 1er février si t=0 = 1er janvier
+EPISODE_START_TIME_S = 28 * 24 * 3600  # 1er février si t=0 = 1er janvier
 
 N_EPISODES = 1
 DETERMINISTIC = True
@@ -28,7 +28,7 @@ MAX_STEPS: int | None = None  # cap steps RL (debug)
 
 # Baseline: agent constant (consigne fixe)
 constant = True
-CONSTANT_VALUE_C = 25.0  # consigne (°C) (base_setpoint du script)
+CONSTANT_VALUE_C = 22.0  # consigne (°C) (base_setpoint du script)
 KEEP_PLOTS_OPEN = False  # sinon les fenêtres peuvent se fermer à la fin du script
 SAVE_PLOTS = False      # utile si backend headless (Agg)
 AUTO_OPEN_SAVED_PLOTS = False  # robuste: ouvre le dossier `plots/`

@@ -20,6 +20,7 @@ def interval_components(  # noqa: PLR0913
     occ_seq: Any,
     php_w_seq: Any,
     price_seq: Any,
+    comfort_huber_k: float = 0.0,
     u_seq: Any | None = None,
     delta_sat_seq: Any | None = None,
     xp=np,
@@ -35,6 +36,9 @@ def interval_components(  # noqa: PLR0913
     Retour :
     - energy_eur : ∫ price(€/kWh) * max(php,0)(kW) dt(h)  [€]
     - comfort_kh : ∫ (violation(K) * occ) dt(h)          [K·h]
+      Option : adoucir la violation près de 0 avec un Huber (comfort_huber_k > 0)
+        v_eff = 0.5*v^2/delta  si v <= delta
+                v - 0.5*delta  sinon
     - u_unit_h   : ∫ |u| dt(h)                           [unit·h] (0 si u_seq=None)
     - tz_kh      : ∫ Tz(K) dt(h)                         [K·h]
     - sat_unit_h : ∫ |delta_sat| dt(h)                   [unit·h] (0 si delta_sat_seq=None)
@@ -52,6 +56,14 @@ def interval_components(  # noqa: PLR0913
     price_seq = xp.asarray(price_seq, dtype=xp.float64)
 
     comfort_dev = xp.maximum(lower_seq_k - tz_seq_k, 0.0) + xp.maximum(tz_seq_k - upper_seq_k, 0.0)
+    if float(comfort_huber_k) > 0.0:
+        # v_eff a la même unité que v (Kelvin), mais est plus doux près de 0.
+        delta = xp.asarray(comfort_huber_k, dtype=xp.float64)
+        comfort_dev = xp.where(
+            comfort_dev <= delta,
+            0.5 * (comfort_dev * comfort_dev) / delta,
+            comfort_dev - 0.5 * delta,
+        )
     comfort_kh = xp.trapezoid(comfort_dev * occ_seq, x=t_step_s) / 3600.0
 
     php_pos_kw = xp.maximum(php_w_seq, 0.0) / 1000.0
@@ -87,6 +99,7 @@ def interval_reward_and_terms(  # noqa: PLR0913
     delta_sat_seq: Any | None = None,
     w_energy: float = DEFAULT_W_ENERGY_EUR,
     w_comfort: float = DEFAULT_W_COMFORT_EUR_PER_KH,
+    comfort_huber_k: float = 0.0,
     w_sat: float = DEFAULT_W_SAT_EUR_PER_UNIT_H,
     w_u: float = 0.0,
     w_tz: float = 0.0,
@@ -105,6 +118,7 @@ def interval_reward_and_terms(  # noqa: PLR0913
         occ_seq=occ_seq,
         php_w_seq=php_w_seq,
         price_seq=price_seq,
+        comfort_huber_k=comfort_huber_k,
         u_seq=u_seq,
         delta_sat_seq=delta_sat_seq,
         xp=xp,

@@ -20,9 +20,9 @@ CFG = dict(
     n_envs=4,
     seed=0,
     fixed_model_idx=None,
-    total_timesteps=5_000_000,
-    model_path="Pre_ppo_rc5_1FA_LSTM.zip",
-    vecnorm_path="vecnormalize_stats_1FA_LSTM.pkl",
+    total_timesteps=3_000_000,
+    model_path="Pre_ppo_rc5_1FA_LSTM_HE.zip",
+    vecnorm_path="vecnormalize_stats_1FA_LSTM_HE.pkl",
 )
 
 ENV_CFG = dict(
@@ -30,18 +30,21 @@ ENV_CFG = dict(
     past_steps=0,
     future_steps=12,
     warmup_steps=4 * 24,
-    base_setpoint=273.15 + 22.0,
+    base_setpoint=273.15 + 21.0,
     # reward = -(w_energy*energy(€) + w_comfort*comfort(K·h) + w_sat*sat(unit·h))
     # Augmenter `w_comfort` => plus de confort (moins de violations), souvent + d'énergie.
     # Augmenter `w_energy`  => moins d'énergie, souvent + d'inconfort.
-    w_energy=1.0,
-    w_comfort=3.0, #Par default 5.0
+    w_energy=2.0,
+    w_comfort=1.0, #Par default 5.0
+    # Adoucit la pénalité confort près de 0 (Huber, en Kelvin).
+    # Si comfort_huber_k > 0, une petite violation est moins pénalisée (évite que l'agent "ait peur" d'approcher).
+    comfort_huber_k=0.5,
     w_sat=0.2,
-    w_u=1.0/5,
+    w_u=1.0/2*0,
     w_tz=1.0/(273.15*5)*0,
     render_episodes=True,
     max_episode_length=24 * 7,
-    excluding_periods=[(28 * 24 * 3600, 39 * 24 * 3600)],
+    excluding_periods=[(28 * 24 * 3600, 36 * 24 * 3600)],
 )
 
 VECNORM_CFG = dict(
@@ -180,7 +183,7 @@ if __name__ == "__main__":
             actor_net.weight.fill_(0.0)
             actor_net.bias.fill_(0.0)
             if hasattr(model.policy, "log_std"):
-                model.policy.log_std.data.fill_(-1.5)
+                model.policy.log_std.data.fill_(-1.0)
 
         tb_log_name = "PPO_RC5_LSTM"
         run_id = get_latest_run_id(PPO_CFG["tensorboard_log"], tb_log_name) + 1
@@ -195,4 +198,3 @@ if __name__ == "__main__":
         venv.save(CFG["vecnorm_path"])
 
     venv.close()
-

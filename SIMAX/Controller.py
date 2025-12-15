@@ -288,6 +288,7 @@ class Controller_MPC(Controller):
     n: int = 1 # Control every n steps
     W: jnp.ndarray = eqx.field(default_factory=lambda: jnp.asarray([0.2/1000.0, 10.0], dtype=jnp.float64))
     cost_core: Callable[..., Any] = eqx.field(default=mpc_cost_core, static=True, repr=False)
+    verbose: bool = True
 
     SetPoints: jnp.ndarray = eqx.field(default_factory=lambda: jnp.asarray([],dtype=jnp.float64))
     i: int = 0
@@ -387,7 +388,8 @@ class Controller_MPC(Controller):
 
         # Cas 1 : full PID (premier appel ou pas de plan MPC précédent)
         if u_window_prev is None or int(i) == 0:
-            print("WS full PID")
+            if self.verbose:
+                print("WS full PID")
             x0 = jnp.asarray(ctrl_state.get("x_i", x_i), dtype=jnp.float64)
 
             sp_window = _get_setpoints_window(setpoints, int(i), self.window_size, forecast, window_grid.shape[0], fallback_val=float(x0[0]))
@@ -401,7 +403,8 @@ class Controller_MPC(Controller):
             return u_pid_bloc[:window_len]
 
         # Cas 2 : truncated (on recycle le plan MPC précédent)
-        print("WS truncated")
+        if self.verbose:
+            print("WS truncated")
         u_prev_bloc = jnp.asarray(u_window_prev, dtype=jnp.float64)[::self.n]
 
         # Si on a au moins 2 blocs, on enlève le premier ; sinon on garde le dernier (unique)
@@ -493,7 +496,7 @@ class Controller_MPC(Controller):
                 args=(ctrl_state, W_arr, forecast),
                 method="SLSQP",
                 bounds=[(0.0, 1.0)] * window_len,
-                options={"maxiter": 50, "ftol": 1e-6, "disp": True}
+                options={"maxiter": 50, "ftol": 1e-6, "disp": bool(self.verbose)}
             )
             u_window_zoh = res.x
             u_window = np.repeat(u_window_zoh, self.n)[:horizon_len]
@@ -503,11 +506,19 @@ class Controller_MPC(Controller):
 
             # Forecast trajectory for logging/debugging
             t_pred, y_pred, x_pred = self.get_forecast_trajectory(u_window, x_i, i, forecast)
+            y_np = np.asarray(y_pred)
+            x_np = np.asarray(x_pred)
+            u_np = np.asarray(u_window)
             ctrl_state["latest_forecast"] = {
                 "time": np.asarray(t_pred),
-                "x_plan_window": np.asarray(x_pred),
-                "y_plan_window": np.asarray(y_pred),
-                "u_plan_window": np.asarray(u_window),
+                # Clés attendues par Simulation.run_numpy (mpc_logs)
+                "y": y_np,
+                "u": u_np,
+                "x": x_np,
+                # Compat: anciennes clés utilisées ailleurs
+                "x_plan_window": x_np,
+                "y_plan_window": y_np,
+                "u_plan_window": u_np,
                 "decision_idx": int(i),
             }
         else:
@@ -547,7 +558,8 @@ class Controller_MPC(Controller):
             f"Y_meas : {y_measurements[0]}"
         )
         ctrl_state["last_log"] = msg
-        print(msg)
+        if self.verbose:
+            print(msg)
 
         return {"oveHeaPumY_u": u_arr, "oveHeaPumY_activate": 1.0}, ctrl_state
         #Pour un MPC, ctrl_state contient l'état interne du MPC (i, x_i, u_prev, u_window, last_log, latest_forecast)
